@@ -20,7 +20,7 @@ import (
 	"gauss2sql-go/internal/types"
 )
 
-var version = "0.1.6"
+var version = "0.1.7"
 
 type options struct {
 	dataPath      string
@@ -340,7 +340,8 @@ func printHelp() {
   --parallel N             并行线程数 (默认 1, 输出与串行逐字节一致)
   --fields COL1,COL2       只导出指定字段 (逗号分隔)
   --header                 CSV 首行输出字段名 (配合 --data, 与 COPY HEADER true 兼容)
-  --encoding ENC           输出编码 (如 UTF8)
+  --encoding ENC           库数据解码编码 (自动探测; 探测失败时可指定
+                           UTF8/GBK/GB18030/LATIN1/SQL_ASCII 等, 输出统一为 UTF-8)
   --verbose                打印导出信息 (表结构/TOAST/输出路径/行数/耗时, 输出到 stderr)
 
 示例:

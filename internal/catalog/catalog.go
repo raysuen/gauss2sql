@@ -27,8 +27,47 @@ const (
 	pgDBRelfile   = 1262
 )
 
+// pgEncodingToCodec openGauss 服务端编码枚举 → 解码 codec 名。
+// 枚举值取自 openGauss 源码 src/include/mb/pg_wchar.h（5.0.0 起全版本一致，
+// 与标准 PostgreSQL 不同：GBK=6、UTF8=7、LATIN1=9、GB18030=36）。
 var pgEncodingToCodec = map[int]string{
-	0: "latin-1", 6: "utf-8",
+	0:  "sql_ascii", // 无转换，字节直通
+	1:  "euc_jp",
+	2:  "euc_cn",
+	3:  "euc_kr",
+	4:  "euc_tw",
+	5:  "euc_jis_2004",
+	6:  "gbk",    // 简体中文（GBK）
+	7:  "utf-8",  // UTF-8
+	8:  "mule_internal",
+	9:  "latin-1",
+	10: "latin-2",
+	11: "latin-3",
+	12: "latin-4",
+	13: "latin-5",
+	14: "latin-6",
+	15: "latin-7",
+	16: "latin-8",
+	17: "latin-9",
+	18: "latin-10",
+	19: "win1256",
+	20: "win1258",
+	21: "win866",
+	22: "win874",
+	23: "koi8r",
+	24: "win1251",
+	25: "win1252",
+	26: "iso_8859_5",
+	27: "iso_8859_6",
+	28: "iso_8859_7",
+	29: "iso_8859_8",
+	30: "win1250",
+	31: "win1253",
+	32: "win1254",
+	33: "win1255",
+	34: "win1257",
+	35: "koi8u",
+	36: "gb18030", // 简体中文（GB18030）
 }
 
 // colItem 布局

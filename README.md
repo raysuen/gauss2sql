@@ -23,7 +23,7 @@ gauss2sql-go 是 gauss2sql（Python 版）的 **Golang 完整重写版**，功�
 - `--parallel N`：并行导出，输出与串行逐字节一致
 - `--deleted / --only-deleted`：导出（仅导出）已删除行（支持 ctid 定位）
 - `--count`：仅统计行数
-- `--fields / --header / --encoding`：字段过滤 / 表头 / 编码选项
+- `--fields / --header / --encoding`：字段过滤 / 表头 / 字符集解码编码（UTF8/GBK/GB18030/LATIN1 等）
 - `--catalog-json --table-name`：配合元数据 JSON 按表名导出（含分区子分区表）
 
 ### 支持的 openGauss 磁盘格式（已破解并移植）
@@ -116,7 +116,7 @@ gauss2sql-go base/16388/16414 --catalog-json meta.json --table-name app.t_del --
 | `--count` | 仅统计行数 |
 | `--fields` | 指定导出字段 |
 | `--header` | CSV 输出表头 |
-| `--encoding` | 输出编码 |
+| `--encoding` | 库数据解码编码（自动探测；探测失败时可指定 `UTF8`/`GBK`/`GB18030`/`LATIN1`/`SQL_ASCII` 等，输出统一为 UTF-8） |
 | `--verbose` | 打印导出信息到 stderr（表结构/TOAST/输出路径/行数/耗时） |
 | `--catalog-json` | 元数据 JSON 路径 |
 | `--table-name` | 按表名导出（支持 schema.table） |
@@ -139,6 +139,7 @@ gauss2sql-go base/16388/16414 --catalog-json meta.json --table-name app.t_del --
 
 ## 五、变更记录
 
+- **v0.1.7（2026-09-29）**：新增非 UTF-8 字符集正确转码导出——引入 Go 官方扩展库 `golang.org/x/text`；修正 openGauss 服务端编码枚举探测（源码 `pg_wchar.h` 确认：GBK=6、UTF8=7、LATIN1=9、GB18030=36，与标准 PostgreSQL 不同）；`GBK/GB18030` 库中文数据导出自动转码为 UTF-8（`--encoding gbk|gb18030` 亦可手动指定），UTF-8 库行为不变，解码失败一律 latin-1 逐字节兜底保证字节可逆。
 - **v0.1.6（2026-09-29）**：输出规则调整——不指定 `-o` 时结果输出到标准输出；`-o` 指定为目录时生成 `<路径>/<schema>.<对象名>.<sql|csv>`。
 - **v0.1.5（2026-09-29）**：新增 `--verbose`——打印导出信息（表结构/TOAST/输出路径/模式/行数/耗时），输出到 stderr 不污染导出文件。
 - **v0.1.4（2026-09-29）**：新增 `-h/--help` 完整命令行帮助（含 `-o` 目录自动命名规则说明），对齐 Python 版帮助结构。
