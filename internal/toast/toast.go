@@ -25,6 +25,7 @@ type ToastFile struct {
 	path     string
 	pageSize int
 	posIdx   map[int][]posEntry // valueid -> [(seq, pageno, offset)]
+	data     []byte             // 整文件读缓存（BuildIndex 时加载，Resolve 只读复用）
 }
 
 type posEntry struct {
@@ -53,6 +54,7 @@ func (t *ToastFile) BuildIndex() {
 		}
 	}
 	t.pageSize = ps
+	t.data = data
 	npages := len(data) / ps
 	for pno := 0; pno < npages; pno++ {
 		raw := data[pno*ps : (pno+1)*ps]
@@ -183,9 +185,14 @@ func (t *ToastFile) Resolve(valueid int) []byte {
 	if !ok {
 		return nil
 	}
-	data, err := os.ReadFile(t.path)
-	if err != nil {
-		return nil
+	data := t.data
+	if data == nil {
+		// 兜底：BuildIndex 未缓存时再读一次（不应发生）
+		var err error
+		data, err = os.ReadFile(t.path)
+		if err != nil {
+			return nil
+		}
 	}
 	var buf []byte
 	for _, e := range entries {

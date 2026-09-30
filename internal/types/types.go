@@ -109,6 +109,38 @@ func EnumLabels(oid int) []string {
 	return enumLabels[oid]
 }
 
+// EnumLookupAll 返回全部枚举成员映射 类型oid -> {成员oid -> 标签}
+// （--export-meta 导出用；map 无序，仅用于解码查表）
+func EnumLookupAll() map[int]map[int]string {
+	out := map[int]map[int]string{}
+	for oid, members := range enumLookup {
+		cp := map[int]string{}
+		for k, v := range members {
+			cp[k] = v
+		}
+		out[oid] = cp
+	}
+	return out
+}
+
+// EnumLabelsAll 返回全部枚举有序标签 类型oid -> []标签
+// （--export-meta 导出用；顺序即 pg_enum 堆扫描顺序，DDL 重建 CREATE TYPE 依赖）
+func EnumLabelsAll() map[int][]string {
+	out := map[int][]string{}
+	for oid, ls := range enumLabels {
+		out[oid] = append([]string{}, ls...)
+	}
+	return out
+}
+
+// SetEnumLabels 注入 类型oid -> 有序标签列表（--catalog-json 重建 DDL 用）
+func SetEnumLabels(m map[int][]string) {
+	enumLabels = map[int][]string{}
+	for oid, ls := range m {
+		enumLabels[oid] = append([]string{}, ls...)
+	}
+}
+
 // ---- varlena payload 提取 ----
 
 func varPayload(b []byte) (payload []byte, isExt bool, ext *binary.ExtPointer) {
@@ -136,6 +168,9 @@ func varPayload(b []byte) (payload []byte, isExt bool, ext *binary.ExtPointer) {
 		}
 		return b[4:end], false, nil
 	case binary.VARLENA4BComp:
+		if total > len(b) {
+			return nil, false, nil
+		}
 		comp := b[4:total]
 		if len(comp) >= 5 {
 			rawlen := int(binary.U32(comp, 0))

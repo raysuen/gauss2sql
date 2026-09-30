@@ -20,7 +20,7 @@ import (
 	"gauss2sql-go/internal/types"
 )
 
-var version = "0.1.7"
+var version = "0.2.5"
 
 type options struct {
 	dataPath      string
@@ -158,7 +158,7 @@ func main() {
 
 	var tm *meta.TableMeta
 	if o.catalogJSON != "" {
-		tm = loadCatalogJSON(o.catalogJSON, o.tableName)
+		tm = loadCatalogJSON(o.catalogJSON, o.tableName, filepath.Base(abs))
 		if tm != nil {
 			vlog(o, "从 JSON 加载元数据: %s.%s (%d 列)", tm.Schema, tm.Relname, len(tm.Columns))
 		}
@@ -175,6 +175,9 @@ func main() {
 	}
 
 	hf := heapfile.NewHeapFile(abs, 0)
+	if o.parallel > 1 {
+		hf.Parallel = o.parallel
+	}
 	// TOAST：reltoastrelid 是 toast 表 OID，需映射到物理 relfilenode
 	if tm.Toastrelid != 0 {
 		tp := catalog.FindPhysicalFileByOid(dbDir, tm.Toastrelid)
@@ -221,7 +224,7 @@ func main() {
 
 	var out strings.Builder
 	if o.ddl {
-		out.WriteString(buildDDL(tm))
+		out.WriteString(buildDDL(tm, dbDir))
 		out.WriteString("\n\n")
 	}
 	if o.sql {
@@ -319,10 +322,11 @@ func printHelp() {
 
 元数据 (可选, 不指定则自动发现):
   --catalog-json FILE      从 JSON 文件加载元数据 (由 --export-meta 导出)
-  --table-name NAME        指定表名 (schema.table 或 table, 配合 --catalog-json)
+  --table-name NAME        指定表名 (schema.table 或 table, 配合 --catalog-json;
+                           不指定时按位置参数文件的 relfilenode 自动匹配)
 
 输出模式:
-  --ddl                    输出 CREATE TABLE DDL 语句
+  --ddl                    输出 CREATE TABLE DDL (含列默认值/主键/唯一/CHECK约束/表列注释)
   --sql                    输出 INSERT 语句
   --data                   输出 CSV 格式 (可用 COPY 导入)
   --deleted                输出已删除和未删除的行 (t_xmax 已设置但未被 vacuum 清理)
@@ -417,7 +421,8 @@ func colTypeSQL(tm *meta.TableMeta, c *meta.Column) string {
 	return base
 }
 
-func buildDDL(tm *meta.TableMeta) string {
+// buildDDL 生成 CREATE TABLE（含默认值/表级约束/注释；catalog-json 模式 Reloid=0 时仅基础列定义）
+func buildDDL(tm *meta.TableMeta, dbDir string) string {
 	var sb strings.Builder
 	// 枚举列前置 CREATE TYPE
 	seenEnum := map[int]bool{}
@@ -437,24 +442,80 @@ func buildDDL(tm *meta.TableMeta) string {
 		}
 		sb.WriteString(`CREATE TYPE "` + tname + `" AS ENUM (` + strings.Join(quoted, ", ") + ");\n")
 	}
+
+	// 默认值 / 约束 / 注释（需 Reloid）
+	var defaults map[int]string
+	var constraints []catalog.ConstraintInfo
+	var comments map[int]string
+	if tm.Reloid != 0 {
+		defaults = catalog.LoadAttrDefaults(dbDir, tm.Reloid, 0)
+		constraints = catalog.LoadConstraints(dbDir, tm.Reloid, 0)
+		comments = catalog.LoadDescriptions(dbDir, tm.Reloid, 0)
+	}
+
+	nameByNum := map[int]string{}
 	var colDefs []string
 	for _, c := range tm.Columns {
 		if c.Attdropped {
 			continue
 		}
+		nameByNum[c.Attnum] = c.Name
 		def := "  \"" + c.Name + "\" " + colTypeSQL(tm, c)
+		if d, ok := defaults[c.Attnum]; ok {
+			def += " DEFAULT " + d
+		}
 		if c.Notnull {
 			def += " NOT NULL"
 		}
 		colDefs = append(colDefs, def)
 	}
+	// 表级约束（主键/唯一/CHECK）
+	var tableCons []string
+	for _, ci := range constraints {
+		var cols []string
+		for _, n := range ci.Cols {
+			if name, ok := nameByNum[n]; ok {
+				cols = append(cols, "\""+name+"\"")
+			}
+		}
+		switch ci.Type {
+		case 'p':
+			if len(cols) > 0 {
+				tableCons = append(tableCons, "  CONSTRAINT \""+ci.Name+"\" PRIMARY KEY ("+strings.Join(cols, ", ")+")")
+			}
+		case 'u':
+			if len(cols) > 0 {
+				tableCons = append(tableCons, "  CONSTRAINT \""+ci.Name+"\" UNIQUE ("+strings.Join(cols, ", ")+")")
+			}
+		case 'c':
+			if ci.Src != "" {
+				tableCons = append(tableCons, "  CONSTRAINT \""+ci.Name+"\" CHECK ("+ci.Src+")")
+			}
+		}
+	}
 	sb.WriteString("CREATE TABLE \"" + tm.Schema + "\".\"" + tm.Relname + "\" (\n")
 	sb.WriteString(strings.Join(colDefs, ",\n"))
+	if len(tableCons) > 0 {
+		sb.WriteString(",\n")
+		sb.WriteString(strings.Join(tableCons, ",\n"))
+	}
 	sb.WriteString("\n);")
+	// 注释
+	for _, c := range tm.Columns {
+		if c.Attdropped {
+			continue
+		}
+		if desc, ok := comments[c.Attnum]; ok && desc != "" {
+			sb.WriteString("\nCOMMENT ON COLUMN \"" + tm.Schema + "\".\"" + tm.Relname + "\".\"" + c.Name + "\" IS '" + strings.ReplaceAll(desc, "'", "''") + "';")
+		}
+	}
+	if desc, ok := comments[0]; ok && desc != "" {
+		sb.WriteString("\nCOMMENT ON TABLE \"" + tm.Schema + "\".\"" + tm.Relname + "\" IS '" + strings.ReplaceAll(desc, "'", "''") + "';")
+	}
 	return sb.String()
 }
 
-func loadCatalogJSON(path, tableName string) *meta.TableMeta {
+func loadCatalogJSON(path, tableName, targetFile string) *meta.TableMeta {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -463,16 +524,76 @@ func loadCatalogJSON(path, tableName string) *meta.TableMeta {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil
 	}
-	// 简化：从 catalog json 重建
+	targetRF := 0
+	if n, err := strconv.Atoi(targetFile); err == nil {
+		targetRF = n
+	}
+	// 枚举注入：成员映射（数据解码）+ 有序标签（DDL CREATE TYPE 重建）
+	if enums, ok := m["enums"].(map[string]interface{}); ok {
+		lookup := map[int]map[int]string{}
+		for toid, members := range enums {
+			tOid := atoiSafe(toid)
+			mm := map[int]string{}
+			if mmap, ok := members.(map[string]interface{}); ok {
+				for moid, lbl := range mmap {
+					if s, ok := lbl.(string); ok {
+						mm[atoiSafe(moid)] = s
+					}
+				}
+			}
+			lookup[tOid] = mm
+		}
+		types.SetEnumMap(lookup)
+	}
+	if labels, ok := m["enum_labels"].(map[string]interface{}); ok {
+		lsMap := map[int][]string{}
+		for toid, ls := range labels {
+			var arr []string
+			if arrI, ok := ls.([]interface{}); ok {
+				for _, v := range arrI {
+					if s, ok := v.(string); ok {
+						arr = append(arr, s)
+					}
+				}
+			}
+			lsMap[atoiSafe(toid)] = arr
+		}
+		types.SetEnumLabels(lsMap)
+	}
 	tables, _ := m["tables"].([]interface{})
 	for _, ti := range tables {
 		t := ti.(map[string]interface{})
 		name, _ := t["table"].(string)
-		if tableName != "" && name != tableName {
-			continue
+		if tableName != "" {
+			if name != tableName {
+				continue
+			}
+		} else if targetRF > 0 {
+			// 未指定表名时按位置参数文件的 relfilenode 匹配
+			if int(getF(t, "relfilenode")) != targetRF {
+				continue
+			}
 		}
 		schema, _ := t["schema"].(string)
 		rfn, _ := t["relfilenode"].(float64)
+		relkind, _ := t["relkind"].(string)
+		toastrelid := int(getF(t, "toastrelid"))
+		var pk []string
+		if pki, ok := t["primary_key"].([]interface{}); ok {
+			for _, v := range pki {
+				if s, ok := v.(string); ok {
+					pk = append(pk, s)
+				}
+			}
+		}
+		typeNames := map[int]string{}
+		if tni, ok := t["type_names"].(map[string]interface{}); ok {
+			for toid, tn := range tni {
+				if s, ok := tn.(string); ok {
+					typeNames[atoiSafe(toid)] = s
+				}
+			}
+		}
 		var cols []*meta.Column
 		rawCols, _ := t["columns"].([]interface{})
 		for _, ci := range rawCols {
@@ -490,9 +611,22 @@ func loadCatalogJSON(path, tableName string) *meta.TableMeta {
 				Attstorage:getStr(cc, "attstorage"),
 			})
 		}
-		return &meta.TableMeta{Schema: schema, Relname: name, Relfilenode: int(rfn), Columns: cols}
+		return &meta.TableMeta{
+			Schema: schema, Relname: name, Relfilenode: int(rfn),
+			Reloid: int(getF(t, "oid")), Relkind: relkind, Toastrelid: toastrelid,
+			PrimaryKey: pk, TypeNames: typeNames, Columns: cols,
+		}
 	}
 	return nil
+}
+
+// atoiSafe 字符串转 int（失败返回 0）
+func atoiSafe(s string) int {
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 func getStr(m map[string]interface{}, k string) string { v, _ := m[k].(string); return v }

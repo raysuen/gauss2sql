@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gauss2sql-go/internal/binary"
 	"gauss2sql-go/internal/meta"
@@ -188,20 +189,24 @@ func CalculateTupleSize(raw []byte, tHoff int, nulls []bool, colLengths []ColLay
 }
 
 // DecodeFields 字段字节 → 可打印值列表（只含未 dropped 列）
+// NullMarker 内部 NULL 哨兵：与空字符串 '' 严格区分。
+// 以 \x00 开头——openGauss text/varchar/jsonb 等文本类型不允许裸 NUL 字节，
+// 因此该标记不可能与真实数据冲突。
+const NullMarker = "\x00__NULL__"
+
 func DecodeFields(fields [][]byte, tm *meta.TableMeta, toast ToastFetcher) []string {
-	types.SetRoleNameMap(tm.RoleMap)
 	var values []string
 	for i, col := range tm.Columns {
 		if col.Attdropped {
 			continue
 		}
 		if i >= len(fields) {
-			values = append(values, "")
+			values = append(values, NullMarker)
 			continue
 		}
 		raw := fields[i]
 		if raw == nil {
-			values = append(values, "")
+			values = append(values, NullMarker)
 			continue
 		}
 		isVar := col.Attlen == -1 || types.VarlenaTypes[col.Atttypid]
@@ -210,7 +215,7 @@ func DecodeFields(fields [][]byte, tm *meta.TableMeta, toast ToastFetcher) []str
 			if kind == binary.VARLENAExternal && toast != nil {
 				ext := binary.ParseExternalPointer(raw, 0)
 				if ext == nil {
-					values = append(values, "")
+					values = append(values, NullMarker)
 					continue
 				}
 				payload := toast.Resolve(int(ext.Valueid))
@@ -250,11 +255,12 @@ type Row struct {
 
 // HeapFile 堆文件读取器
 type HeapFile struct {
-	Path       string
-	PageSize   int
-	Toast      ToastFetcher
-	badPages   []int
-	pageSize   int
+	Path     string
+	PageSize int
+	Toast    ToastFetcher
+	Parallel int // 页级并行工作数（>1 时 DumpRows 自动走并行路径）
+	badPages []int
+	pageSize int
 }
 
 // NewHeapFile 打开堆文件
@@ -290,12 +296,15 @@ func (h *HeapFile) IterPages(cb func(pageno int, pg *page.Page) bool) {
 	if err != nil {
 		return
 	}
-	npages := len(data) / ps
-	for pno := 0; pno < npages; pno++ {
+	h.iterPagesRange(data, ps, 0, len(data)/ps, cb)
+}
+
+// iterPagesRange 指定页范围 [start, end) 逐页回调（共享整文件数据，供并行分片使用）
+func (h *HeapFile) iterPagesRange(data []byte, ps, start, end int, cb func(pageno int, pg *page.Page) bool) {
+	for pno := start; pno < end; pno++ {
 		raw := data[pno*ps : (pno+1)*ps]
 		pg := page.NewPage(pno, raw, ps)
 		if !pg.HasValidLayout {
-			h.badPages = append(h.badPages, pno)
 			continue
 		}
 		if !cb(pno, pg) {
@@ -304,9 +313,9 @@ func (h *HeapFile) IterPages(cb func(pageno int, pg *page.Page) bool) {
 	}
 }
 
-// iterTuples 标准 ItemId 遍历
-func (h *HeapFile) iterTuples(includeDeleted bool, cb func(pageno, idx int, t *tuple.HeapTuple) bool) {
-	h.IterPages(func(pageno int, pg *page.Page) bool {
+// iterTuplesRange 指定页范围标准 ItemId 遍历
+func (h *HeapFile) iterTuplesRange(data []byte, ps, start, end int, includeDeleted bool, cb func(pageno, idx int, t *tuple.HeapTuple) bool) {
+	h.iterPagesRange(data, ps, start, end, func(pageno int, pg *page.Page) bool {
 		for _, it := range pg.Items {
 			if it.Flags != page.ItemIDNormal {
 				continue
@@ -327,9 +336,9 @@ func (h *HeapFile) iterTuples(includeDeleted bool, cb func(pageno, idx int, t *t
 	})
 }
 
-// scanTuples 数据区扫描兜底
-func (h *HeapFile) scanTuples(nExpected int, colLengths []ColLayout, cb func(pageno, pos int, t *tuple.HeapTuple) bool) {
-	h.IterPages(func(pageno int, pg *page.Page) bool {
+// scanTuplesRange 指定页范围数据区扫描兜底
+func (h *HeapFile) scanTuplesRange(data []byte, ps, start, end int, nExpected int, colLengths []ColLayout, cb func(pageno, pos int, t *tuple.HeapTuple) bool) {
+	h.iterPagesRange(data, ps, start, end, func(pageno int, pg *page.Page) bool {
 		pdUpper := pg.Upper
 		pdSpecial := pg.Special
 		if pdUpper < pg.HeaderSize || pdUpper >= pdSpecial {
@@ -378,38 +387,44 @@ func (h *HeapFile) scanTuples(nExpected int, colLengths []ColLayout, cb func(pag
 	})
 }
 
-// DumpRows 产出行
+// iterTuples 标准 ItemId 遍历（串行）
+func (h *HeapFile) iterTuples(includeDeleted bool, cb func(pageno, idx int, t *tuple.HeapTuple) bool) {
+	ps := h.detectSize()
+	h.pageSize = ps
+	data, err := os.ReadFile(h.Path)
+	if err != nil {
+		return
+	}
+	h.iterTuplesRange(data, ps, 0, len(data)/ps, includeDeleted, cb)
+}
+
+// scanTuples 数据区扫描兜底（串行）
+func (h *HeapFile) scanTuples(nExpected int, colLengths []ColLayout, cb func(pageno, pos int, t *tuple.HeapTuple) bool) {
+	ps := h.detectSize()
+	h.pageSize = ps
+	data, err := os.ReadFile(h.Path)
+	if err != nil {
+		return
+	}
+	h.scanTuplesRange(data, ps, 0, len(data)/ps, nExpected, colLengths, cb)
+}
+
+// DumpRows 产出行（--parallel>1 且无 limit 时自动走页级并行）
 func (h *HeapFile) DumpRows(tm *meta.TableMeta, includeDeleted, onlyDeleted bool, limit int) []Row {
 	if onlyDeleted {
 		includeDeleted = true
 	}
+	if h.Parallel > 1 && limit == 0 {
+		return h.DumpRowsParallel(tm, includeDeleted, onlyDeleted, h.Parallel)
+	}
+	return h.dumpRowsSerial(tm, includeDeleted, onlyDeleted, limit)
+}
+
+// dumpRowsSerial 串行主体（两阶段：标准 ItemId 遍历 → 数据区扫描兜底）
+func (h *HeapFile) dumpRowsSerial(tm *meta.TableMeta, includeDeleted, onlyDeleted bool, limit int) []Row {
+	types.SetRoleNameMap(tm.RoleMap)
 	colLengths := BuildColLengths(tm)
 	nExpected := len(tm.Columns)
-
-	buildRow := func(t *tuple.HeapTuple, blk, off int) *Row {
-		deleted := t.IsDeleted()
-		if !t.IsLive() && !deleted {
-			return nil
-		}
-		if !includeDeleted && deleted {
-			return nil
-		}
-		if onlyDeleted && !deleted {
-			return nil
-		}
-		nulls := t.GetNulls()
-		fields := ExtractFieldsDirect(t.Raw, int(t.HOff), nulls, colLengths)
-		values := DecodeFields(fields, tm, h.Toast)
-		return &Row{Ctid: fmtCtid(blk, off), Values: values, Deleted: deleted}
-	}
-	rowHasValid := func(r *Row) bool {
-		for _, v := range r.Values {
-			if v != "" && v != "__TOAST_MISSING__" {
-				return true
-			}
-		}
-		return false
-	}
 
 	// Phase 1
 	var standard []Row
@@ -418,7 +433,7 @@ func (h *HeapFile) DumpRows(tm *meta.TableMeta, includeDeleted, onlyDeleted bool
 	count := 0
 	h.iterTuples(true, func(pageno, idx int, t *tuple.HeapTuple) bool {
 		foundStandard = true
-		r := buildRow(t, pageno, idx)
+		r := h.buildRow(t, pageno, idx, tm, colLengths, includeDeleted, onlyDeleted)
 		if r == nil {
 			return true
 		}
@@ -440,7 +455,7 @@ func (h *HeapFile) DumpRows(tm *meta.TableMeta, includeDeleted, onlyDeleted bool
 	var out []Row
 	count = 0
 	h.scanTuples(nExpected, colLengths, func(pageno, pos int, t *tuple.HeapTuple) bool {
-		r := buildRow(t, pageno, pos)
+		r := h.buildRow(t, pageno, pos, tm, colLengths, includeDeleted, onlyDeleted)
 		if r == nil {
 			return true
 		}
@@ -451,6 +466,140 @@ func (h *HeapFile) DumpRows(tm *meta.TableMeta, includeDeleted, onlyDeleted bool
 		}
 		return true
 	})
+	return out
+}
+
+// buildRow 由 HeapTuple 构建行（含删除/存活过滤）
+func (h *HeapFile) buildRow(t *tuple.HeapTuple, blk, off int, tm *meta.TableMeta, colLengths []ColLayout, includeDeleted, onlyDeleted bool) *Row {
+	deleted := t.IsDeleted()
+	if !t.IsLive() && !deleted {
+		return nil
+	}
+	if !includeDeleted && deleted {
+		return nil
+	}
+	if onlyDeleted && !deleted {
+		return nil
+	}
+	nulls := t.GetNulls()
+	fields := ExtractFieldsDirect(t.Raw, int(t.HOff), nulls, colLengths)
+	values := DecodeFields(fields, tm, h.Toast)
+	return &Row{Ctid: fmtCtid(blk, off), Values: values, Deleted: deleted}
+}
+
+func rowHasValid(r *Row) bool {
+	for _, v := range r.Values {
+		if v != "" && v != NullMarker && v != "__TOAST_MISSING__" && v != "__TOAST_CORRUPT__" {
+			return true
+		}
+	}
+	return false
+}
+
+// DumpRowsParallel 页级并行产出行（workers>1）。
+// 语义与串行 DumpRows 完全一致：Phase1 标准 ItemId 遍历全并行 → 全局判定
+// 是否使用标准结果；否则 Phase2 数据区扫描兜底全并行。段内按页序、段间按
+// 页范围顺序合并，输出与串行逐字节一致。
+func (h *HeapFile) DumpRowsParallel(tm *meta.TableMeta, includeDeleted, onlyDeleted bool, workers int) []Row {
+	types.SetRoleNameMap(tm.RoleMap)
+	colLengths := BuildColLengths(tm)
+	nExpected := len(tm.Columns)
+
+	ps := h.detectSize()
+	data, err := os.ReadFile(h.Path)
+	if err != nil {
+		return nil
+	}
+	npages := len(data) / ps
+	if npages < 2 {
+		return h.dumpRowsSerial(tm, includeDeleted, onlyDeleted, 0)
+	}
+	if workers > npages {
+		workers = npages
+	}
+
+	// 页范围分段（按页号连续切分，保证合并顺序）
+	segs := make([][2]int, workers)
+	base, rem := npages/workers, npages%workers
+	cur := 0
+	for i := 0; i < workers; i++ {
+		n := base
+		if i < rem {
+			n++
+		}
+		segs[i] = [2]int{cur, cur + n}
+		cur += n
+	}
+
+	type segResult struct {
+		rows     []Row
+		hasValid bool
+	}
+	var wg sync.WaitGroup
+
+	// Phase 1：标准 ItemId 遍历（全并行）
+	results := make([]segResult, workers)
+	for i, s := range segs {
+		wg.Add(1)
+		go func(i int, s [2]int) {
+			defer wg.Done()
+			var rows []Row
+			hasValid := false
+			h.iterTuplesRange(data, ps, s[0], s[1], true, func(pageno, idx int, t *tuple.HeapTuple) bool {
+				r := h.buildRow(t, pageno, idx, tm, colLengths, includeDeleted, onlyDeleted)
+				if r == nil {
+					return true
+				}
+				rows = append(rows, *r)
+				if rowHasValid(r) {
+					hasValid = true
+				}
+				return true
+			})
+			results[i] = segResult{rows: rows, hasValid: hasValid}
+		}(i, s)
+	}
+	wg.Wait()
+
+	globalValid := false
+	for i := range results {
+		if results[i].hasValid {
+			globalValid = true
+			break
+		}
+	}
+	if globalValid {
+		var out []Row
+		for i := range results {
+			out = append(out, results[i].rows...)
+		}
+		return out
+	}
+
+	// Phase 2：数据区扫描兜底（全并行）
+	h.badPages = nil
+	results2 := make([]segResult, workers)
+	for i, s := range segs {
+		wg.Add(1)
+		go func(i int, s [2]int) {
+			defer wg.Done()
+			var rows []Row
+			h.scanTuplesRange(data, ps, s[0], s[1], nExpected, colLengths, func(pageno, pos int, t *tuple.HeapTuple) bool {
+				r := h.buildRow(t, pageno, pos, tm, colLengths, includeDeleted, onlyDeleted)
+				if r == nil {
+					return true
+				}
+				rows = append(rows, *r)
+				return true
+			})
+			results2[i] = segResult{rows: rows}
+		}(i, s)
+	}
+	wg.Wait()
+	var out []Row
+	for i := range results2 {
+		out = append(out, results2[i].rows...)
+	}
 	return out
 }
 
@@ -510,7 +659,7 @@ func (h *HeapFile) ToSQL(tm *meta.TableMeta, includeDeleted, onlyDeleted bool, l
 		var sqlVals []string
 		for k, i := range outIdx {
 			v := row.Values[i]
-			if v == "" || v == "__TOAST_MISSING__" {
+			if v == NullMarker || v == "__TOAST_MISSING__" || v == "__TOAST_CORRUPT__" {
 				sqlVals = append(sqlVals, "NULL")
 			} else {
 				sqlVals = append(sqlVals, sqlQuoteValue(v, liveCols[outIdx[k]]))
@@ -565,7 +714,7 @@ func (h *HeapFile) ToData(tm *meta.TableMeta, includeDeleted, onlyDeleted bool, 
 		var parts []string
 		for _, i := range outIdx {
 			v := row.Values[i]
-			if v == "" || v == "__TOAST_MISSING__" {
+			if v == NullMarker || v == "__TOAST_MISSING__" || v == "__TOAST_CORRUPT__" {
 				parts = append(parts, `\N`)
 			} else {
 				parts = append(parts, csvField(v))

@@ -21,6 +21,7 @@ type TableMeta struct {
 	Schema      string
 	Relname     string
 	Relfilenode int
+	Reloid      int // pg_class OID（加载默认值/约束/注释用）
 	Columns     []*Column
 	Relkind     string
 	Hastoast    bool

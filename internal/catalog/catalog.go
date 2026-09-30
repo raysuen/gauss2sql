@@ -19,12 +19,15 @@ import (
 )
 
 const (
-	pgClassOID    = 1259
-	pgAttrOID     = 1249
-	pgTypeOID     = 1247
-	pgNSOID       = 2615
-	pgEnumRelfile = 3501
-	pgDBRelfile   = 1262
+	pgClassOID       = 1259
+	pgAttrOID        = 1249
+	pgTypeOID        = 1247
+	pgNSOID          = 2615
+	pgAttrdefOID     = 2604 // openGauss/PostgreSQL 实际 OID（2600 是 pg_aggregate）
+	pgConstraintOID  = 2606
+	pgDescriptionOID = 2609
+	pgEnumRelfile    = 3501
+	pgDBRelfile      = 1262
 )
 
 // pgEncodingToCodec openGauss 服务端编码枚举 → 解码 codec 名。
@@ -108,6 +111,36 @@ var ogNSCols = []colItem{{64, false, "c"}, {4, false, "i"}}
 var ogPartitionCols = []colItem{
 	{64, false, "c"}, {1, false, "c"}, {4, false, "i"},
 	{4, false, "i"}, {4, false, "i"}, {1, false, "c"}, {4, false, "i"},
+}
+
+// pg_attrdef (OID 2600): adrelid oid, adnum int2, adbin pg_node_tree, adsrc text
+var ogAttrdefCols = []colItem{
+	{4, false, "i"}, {2, false, "s"},
+	{-1, true, "i"}, {-1, true, "i"},
+}
+
+// pg_constraint (OID 2606): conname name, connamespace oid, contype char,
+//   condeferrable/condeferred/convalidated bool, conrelid oid, contypid oid,
+//   conindid oid, confrelid oid, confupdtype/confdeltype/confmatchtype char,
+//   conislocal bool, coninhcount int4, connoinherit/consoft/conopt bool,
+//   conkey int2[], confkey int2[], conpfeqop/conppeqop/conffeqop/conexclop oid[],
+//   conbin pg_node_tree, consrc text
+var ogConstraintCols = []colItem{
+	{64, false, "c"}, {4, false, "i"}, {1, false, "c"},
+	{1, false, "c"}, {1, false, "c"}, {1, false, "c"},
+	{4, false, "i"}, {4, false, "i"}, {4, false, "i"},
+	{4, false, "i"},
+	{1, false, "c"}, {1, false, "c"}, {1, false, "c"},
+	{1, false, "c"}, {4, false, "i"}, {1, false, "c"},
+	{1, false, "c"}, {1, false, "c"},
+	{-1, true, "i"}, {-1, true, "i"}, {-1, true, "i"},
+	{-1, true, "i"}, {-1, true, "i"}, {-1, true, "i"},
+	{-1, true, "i"}, {-1, true, "i"},
+}
+
+// pg_description (OID 2609): objoid oid, classoid oid, objsubid int4, description text
+var ogDescriptionCols = []colItem{
+	{4, false, "i"}, {4, false, "i"}, {4, false, "i"}, {-1, true, "i"},
 }
 
 // ---- relmapper ----
@@ -365,6 +398,173 @@ func partitionFields(t *tuple.HeapTuple) (relname, parttype string, parentid, rf
 	return
 }
 
+// ---- 默认值 / 约束 / 注释 ----
+
+// ConstraintInfo 表级约束（主键/唯一/CHECK）
+type ConstraintInfo struct {
+	Name string
+	Type byte  // 'p' 主键, 'u' 唯一, 'c' CHECK
+	Cols []int // conkey（列号，主键/唯一）
+	Src  string // consrc（CHECK 表达式文本）
+}
+
+func attrdefFields(t *tuple.HeapTuple) (relid, attnum int, adsrc string) {
+	defer func() { recover() }()
+	fields := heapfile.ExtractFieldsDirect(t.Raw, int(t.HOff), t.GetNulls(), ogAttrdefCols)
+	if len(fields) < 4 || fields[0] == nil {
+		return 0, 0, ""
+	}
+	relid = int(binary.U32(fields[0], 0))
+	if fields[1] != nil && len(fields[1]) >= 2 {
+		attnum = int(int16(binary.U16(fields[1], 0)))
+	}
+	if fields[3] != nil {
+		adsrc = varlenaText(fields[3])
+	}
+	return
+}
+
+func constraintFields(t *tuple.HeapTuple) (name string, ctype byte, relid int, key []int, src string) {
+	defer func() { recover() }()
+	fields := heapfile.ExtractFieldsDirect(t.Raw, int(t.HOff), t.GetNulls(), ogConstraintCols)
+	if len(fields) < 26 || fields[0] == nil {
+		return "", 0, 0, nil, ""
+	}
+	end := 0
+	for end < len(fields[0]) && fields[0][end] != 0 {
+		end++
+	}
+	name = binary.DecodeBytes(fields[0][:end])
+	if fields[2] != nil && len(fields[2]) >= 1 {
+		ctype = fields[2][0]
+	}
+	if fields[6] != nil && len(fields[6]) >= 4 {
+		relid = int(binary.U32(fields[6], 0))
+	}
+	if fields[18] != nil {
+		key = decodeInt2Array(fields[18])
+	}
+	if fields[25] != nil {
+		src = varlenaText(fields[25])
+	}
+	return
+}
+
+// decodeInt2Array 解析 int2[] 数组（conkey/confkey 等），返回元素值列表
+func decodeInt2Array(raw []byte) []int {
+	if len(raw) < 16 {
+		return nil
+	}
+	// 剥掉 varlena 头（兼容 1B 短头 / 4B 头）
+	kind, _, poff, plen := binary.VarlenaParse(raw, 0)
+	if kind == "" || poff+plen > len(raw) {
+		return nil
+	}
+	payload := raw[poff : poff+plen]
+	if len(payload) < 12 {
+		return nil
+	}
+	dims := int(binary.U32(payload, 0))
+	if dims != 1 {
+		return nil
+	}
+	if elemtype := binary.U32(payload, 8); elemtype != 21 { // int2
+		return nil
+	}
+	// 数组头：ndim(4)+dataoffset(4)+elemtype(4) + 每维 nelems(4)+lowerbound(4)
+	nelems := int(binary.U32(payload, 12))
+	dataOff := int(binary.U32(payload, 4))
+	body := payload[20:] // 12 基础头 + 8 维头
+	if dataOff > 0 && dataOff <= len(body) {
+		body = body[dataOff:] // NULL 位图
+	}
+	if nelems < 0 || nelems*2 > len(body) {
+		return nil
+	}
+	out := make([]int, 0, nelems)
+	for i := 0; i < nelems; i++ {
+		out = append(out, int(int16(binary.U16(body, i*2))))
+	}
+	return out
+}
+
+// varlenaText 从 ExtractFieldsDirect 返回的整段 varlena（含头）中取出文本负载。
+func varlenaText(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	kind, _, poff, plen := binary.VarlenaParse(b, 0)
+	if kind == "" || poff+plen > len(b) {
+		return string(b)
+	}
+	return string(b[poff : poff+plen])
+}
+
+// LoadAttrDefaults 读 pg_attrdef：reloid → {attnum: adsrc}
+func LoadAttrDefaults(dbDir string, relOid, pageSize int) map[int]string {
+	out := map[int]string{}
+	path := SysFilePath(dbDir, pgAttrdefOID)
+	if path == "" {
+		return out
+	}
+	iterateTuples(path, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
+		relid, attnum, adsrc := attrdefFields(t)
+		if relid == relOid && attnum > 0 && adsrc != "" {
+			out[attnum] = adsrc
+		}
+		return true
+	})
+	return out
+}
+
+// LoadConstraints 读 pg_constraint：reloid → 约束列表（contype p/u/c，跳过外键/检查未验证）
+func LoadConstraints(dbDir string, relOid, pageSize int) []ConstraintInfo {
+	var out []ConstraintInfo
+	path := SysFilePath(dbDir, pgConstraintOID)
+	if path == "" {
+		return out
+	}
+	iterateTuples(path, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
+		name, ctype, relid, key, src := constraintFields(t)
+		if relid != relOid {
+			return true
+		}
+		switch ctype {
+		case 'p', 'u':
+			if len(key) > 0 {
+				out = append(out, ConstraintInfo{Name: name, Type: ctype, Cols: key})
+			}
+		case 'c':
+			if src != "" {
+				out = append(out, ConstraintInfo{Name: name, Type: ctype, Src: src})
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// LoadDescriptions 读 pg_description：reloid → {attnum: 描述}，attnum=0 表示表注释
+func LoadDescriptions(dbDir string, relOid, pageSize int) map[int]string {
+	out := map[int]string{}
+	path := SysFilePath(dbDir, pgDescriptionOID)
+	if path == "" {
+		return out
+	}
+	iterateTuples(path, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
+		defer func() { recover() }()
+		fields := heapfile.ExtractFieldsDirect(t.Raw, int(t.HOff), t.GetNulls(), ogDescriptionCols)
+		if len(fields) < 4 || fields[0] == nil || fields[2] == nil || fields[3] == nil {
+			return true
+		}
+		if int(binary.U32(fields[0], 0)) == relOid {
+			out[int(binary.U32(fields[2], 0))] = varlenaText(fields[3])
+		}
+		return true
+	})
+	return out
+}
+
 // ---- 加载枚举映射 ----
 
 // LoadEnumMap 读 pg_enum
@@ -553,10 +753,11 @@ func AutoDiscoverMeta(dataFile string, pageSize int) *meta.TableMeta {
 	sort.Slice(cols, func(i, j int) bool { return cols[i].Attnum < cols[j].Attnum })
 	tm := &meta.TableMeta{
 		DBName: filepath.Base(dbDir), Schema: schema, Relname: targetRelname,
-		Relfilenode: targetRF, Columns: cols, Relkind: targetRelkind,
+		Relfilenode: targetRF, Reloid: targetOid, Columns: cols, Relkind: targetRelkind,
 		Toastrelid: targetToastrelid,
-		TypeNames:   BuildTypeNameMap(dbDir),
+		TypeNames:  BuildTypeNameMap(dbDir),
 	}
+	tm.PrimaryKey = primaryKeyCols(LoadConstraints(dbDir, targetOid, pageSize), cols)
 	return tm
 }
 
@@ -633,9 +834,32 @@ func tryPartitionFallback(dbDir string, targetRF, pageSize int) *meta.TableMeta 
 	sort.Slice(cols, func(i, j int) bool { return cols[i].Attnum < cols[j].Attnum })
 	return &meta.TableMeta{
 		DBName: filepath.Base(dbDir), Schema: schema, Relname: parentRelname,
-		Relfilenode: targetRF, Columns: cols, Relkind: parentRelkind,
+		Relfilenode: targetRF, Reloid: parentOid, Columns: cols, Relkind: parentRelkind,
 		TypeNames: BuildTypeNameMap(dbDir),
 	}
+}
+
+// primaryKeyCols 从约束中提取主键列名（contype='p'）
+func primaryKeyCols(cs []ConstraintInfo, cols []*meta.Column) []string {
+	nameByNum := map[int]string{}
+	for _, c := range cols {
+		if !c.Attdropped {
+			nameByNum[c.Attnum] = c.Name
+		}
+	}
+	for _, ci := range cs {
+		if ci.Type != 'p' {
+			continue
+		}
+		var out []string
+		for _, n := range ci.Cols {
+			if name, ok := nameByNum[n]; ok {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // FindPhysicalFileByOid 按表 OID 查 pg_class 取物理 relfilenode 文件名
@@ -759,12 +983,15 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) map[string]*meta.TableMet
 
 // ExportMetaTable 导出 JSON 用表
 type ExportMetaTable struct {
-	Schema     string         `json:"schema"`
-	Table      string         `json:"table"`
-	Relfilenode int           `json:"relfilenode"`
-	Toastrelid int            `json:"toastrelid"`
-	PrimaryKey []string       `json:"primary_key"`
-	Columns    []ExportCol    `json:"columns"`
+	Schema      string            `json:"schema"`
+	Table       string            `json:"table"`
+	Oid         int               `json:"oid"`
+	Relkind     string            `json:"relkind"`
+	Relfilenode int               `json:"relfilenode"`
+	Toastrelid  int               `json:"toastrelid"`
+	PrimaryKey  []string          `json:"primary_key"`
+	TypeNames   map[int]string    `json:"type_names"`
+	Columns     []ExportCol       `json:"columns"`
 }
 
 // ExportCol 导出 JSON 列
@@ -783,9 +1010,11 @@ type ExportCol struct {
 
 // ExportMetaJSON export-meta 输出
 type ExportMetaJSON struct {
-	Database string            `json:"database"`
-	PgVersion int               `json:"pg_version"`
-	Tables   []ExportMetaTable `json:"tables"`
+	Database   string             `json:"database"`
+	PgVersion  int                `json:"pg_version"`
+	Enums      map[int]map[int]string `json:"enums"`       // 枚举成员映射（数据解码用）
+	EnumLabels map[int][]string   `json:"enum_labels"`     // 枚举有序标签（DDL 重建用）
+	Tables     []ExportMetaTable  `json:"tables"`
 }
 
 // AutoDiscoverAllTablesOrdered 按 pg_class 插入顺序返回去重后的表列表
@@ -807,6 +1036,27 @@ func AutoDiscoverAllTablesOrdered(dbDir string, pageSize int) []*meta.TableMeta 
 	if pgAttrPath != "" {
 		attByRel = loadAttrs(abs, pgAttrPath)
 	}
+	// 约束按 reloid 预分组（避免每表全扫 pg_constraint）
+	constraintByRel := map[int][]ConstraintInfo{}
+	if cPath := SysFilePath(abs, pgConstraintOID); cPath != "" {
+		iterateTuples(cPath, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
+			name, ctype, relid, key, src := constraintFields(t)
+			if relid == 0 {
+				return true
+			}
+			switch ctype {
+			case 'p', 'u':
+				if len(key) > 0 {
+					constraintByRel[relid] = append(constraintByRel[relid], ConstraintInfo{Name: name, Type: ctype, Cols: key})
+				}
+			case 'c':
+				if src != "" {
+					constraintByRel[relid] = append(constraintByRel[relid], ConstraintInfo{Name: name, Type: ctype, Src: src})
+				}
+			}
+			return true
+		})
+	}
 	type entry struct{ tm *meta.TableMeta }
 	pos := map[string]int{}
 	var order []*meta.TableMeta
@@ -821,9 +1071,11 @@ func AutoDiscoverAllTablesOrdered(dbDir string, pageSize int) []*meta.TableMeta 
 		}
 		tm := &meta.TableMeta{
 			DBName: filepath.Base(abs), Schema: schema, Relname: row.relname,
-			Relfilenode: row.relfilenode, Columns: cols, Relkind: row.relkind,
-			TypeNames: BuildTypeNameMap(abs),
+			Relfilenode: row.relfilenode, Reloid: row.oid, Columns: cols, Relkind: row.relkind,
+			Toastrelid: row.toastrelid,
+			TypeNames:  BuildTypeNameMap(abs),
 		}
+		tm.PrimaryKey = primaryKeyCols(constraintByRel[row.oid], cols)
 		if _, ok := pos[tm.FullName()]; !ok {
 			pos[tm.FullName()] = len(order)
 			order = append(order, tm)
@@ -841,6 +1093,10 @@ func AutoDiscoverAllTablesOrdered(dbDir string, pageSize int) []*meta.TableMeta 
 
 // ExportMetaToJSON 离线导出元数据
 func ExportMetaToJSON(dbDir string, pageSize int) ExportMetaJSON {
+	// 修复 v0.2.1：--export-meta 分支在 main.go 提前 return，走不到直连路径的
+	// catalog.LoadEnumMap(dbDir)（main.go:157），导致此处 EnumLookupAll/EnumLabelsAll
+	// 取到空映射、meta.json 的 enums/enum_labels 恒为空。此处补一次加载，与直连路径一致。
+	LoadEnumMap(dbDir)
 	ordered := AutoDiscoverAllTablesOrdered(dbDir, pageSize)
 	seen := map[string]bool{}
 	var out []ExportMetaTable
@@ -873,12 +1129,21 @@ func ExportMetaToJSON(dbDir string, pageSize int) ExportMetaJSON {
 		if pk == nil {
 			pk = []string{}
 		}
+		tn := tm.TypeNames
+		if tn == nil {
+			tn = map[int]string{}
+		}
 		out = append(out, ExportMetaTable{
-			Schema: tm.Schema, Table: tm.Relname, Relfilenode: tm.Relfilenode,
-			Toastrelid: tm.Toastrelid, PrimaryKey: pk, Columns: cols,
+			Schema: tm.Schema, Table: tm.Relname, Oid: tm.Reloid, Relkind: tm.Relkind,
+			Relfilenode: tm.Relfilenode, Toastrelid: tm.Toastrelid,
+			PrimaryKey: pk, TypeNames: tn, Columns: cols,
 		})
 	}
-	return ExportMetaJSON{Database: filepath.Base(dbDir), PgVersion: 92004, Tables: out}
+	return ExportMetaJSON{
+		Database: filepath.Base(dbDir), PgVersion: 92004,
+		Enums: types.EnumLookupAll(), EnumLabels: types.EnumLabelsAll(),
+		Tables: out,
+	}
 }
 
 // MarshalIndent JSON 输出（2 空格缩进，非 ASCII 原样）
