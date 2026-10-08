@@ -26,6 +26,7 @@ const (
 	pgAttrdefOID     = 2604 // openGauss/PostgreSQL 实际 OID（2600 是 pg_aggregate）
 	pgConstraintOID  = 2606
 	pgDescriptionOID = 2609
+	pgIndexOID       = 2610 // openGauss pg_index 目录 OID（与 PG 2654 不同，经 pg_class 实测）
 	pgEnumRelfile    = 3501
 	pgDBRelfile      = 1262
 )
@@ -162,6 +163,42 @@ func loadRelmapper(dir string) map[int]int {
 	return m
 }
 
+// rfnClassCache 系统目录 OID → 实时 relfilenode 的进程内缓存（dbDir+oid 键），
+// 避免批量导出每表多次全扫 pg_class。仅 relmapper/std 未命中路径填充，正常库无额外开销。
+var rfnClassCache = map[string]int{}
+
+// lookupRfnByClass 通过 pg_class 回查系统目录对象的实时 relfilenode（磁盘文件存在才返回）。
+// openGauss 运行中 relmapper（pg_filenode.map）刷盘可能滞后，以 pg_class.relfilenode 为准。
+func lookupRfnByClass(dbDir string, standardOid int) int {
+	if standardOid == pgClassOID {
+		return 0 // pg_class 自身走 std/relmapper，避免递归
+	}
+	key := dbDir + ":" + strconv.Itoa(standardOid)
+	if v, ok := rfnClassCache[key]; ok {
+		return v
+	}
+	pc := SysFilePath(dbDir, pgClassOID)
+	if pc == "" {
+		return 0
+	}
+	found := 0
+	iterateTuples(pc, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
+		row := classFields(t)
+		if row == nil {
+			return true
+		}
+		if row.oid == standardOid && row.relfilenode != 0 && row.relfilenode != standardOid {
+			if _, err := os.Stat(filepath.Join(dbDir, strconv.Itoa(row.relfilenode))); err == nil {
+				found = row.relfilenode
+				return false
+			}
+		}
+		return true
+	})
+	rfnClassCache[key] = found
+	return found
+}
+
 // SysFilePath 定位系统目录物理文件
 func SysFilePath(dbDir string, standardOid int) string {
 	std := filepath.Join(dbDir, strconv.Itoa(standardOid))
@@ -169,33 +206,16 @@ func SysFilePath(dbDir string, standardOid int) string {
 		return std
 	}
 	fn := loadRelmapper(dbDir)[standardOid]
+	// relmapper 命中后仍以 pg_class 实时 rfn 为准（运行中集群 VACUUM FULL 等场景 relmapper 滞后）
+	if fresh := lookupRfnByClass(dbDir, standardOid); fresh != 0 {
+		if _, err := os.Stat(filepath.Join(dbDir, strconv.Itoa(fresh))); err == nil {
+			return filepath.Join(dbDir, strconv.Itoa(fresh))
+		}
+	}
 	if fn != 0 {
 		p := filepath.Join(dbDir, strconv.Itoa(fn))
 		if _, err := os.Stat(p); err == nil {
 			return p
-		}
-	}
-	if standardOid != pgClassOID {
-		pc := SysFilePath(dbDir, pgClassOID)
-		if pc != "" {
-			iterateTuples(pc, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
-				row := classFields(t)
-				if row == nil {
-					return true
-				}
-				oid, rfn := row.oid, row.relfilenode
-				if oid == standardOid && rfn != 0 && rfn != standardOid {
-					p := filepath.Join(dbDir, strconv.Itoa(rfn))
-					if _, err := os.Stat(p); err == nil {
-						pc = p
-						return false
-					}
-				}
-				return true
-			})
-			if pc != "" && pc != filepath.Join(dbDir, strconv.Itoa(pgClassOID)) {
-				return pc
-			}
 		}
 	}
 	return ""
@@ -344,7 +364,7 @@ func attrFields(t *tuple.HeapTuple) *AttrRow {
 		return -1
 	}
 	boolf := func(i int) bool {
-		if fields[i] == nil {
+		if fields[i] == nil || len(fields[i]) == 0 {
 			return false
 		}
 		v := fields[i][0]
@@ -402,10 +422,11 @@ func partitionFields(t *tuple.HeapTuple) (relname, parttype string, parentid, rf
 
 // ConstraintInfo 表级约束（主键/唯一/CHECK）
 type ConstraintInfo struct {
-	Name string
-	Type byte  // 'p' 主键, 'u' 唯一, 'c' CHECK
-	Cols []int // conkey（列号，主键/唯一）
-	Src  string // consrc（CHECK 表达式文本）
+	Name     string
+	Type     byte  // 'p' 主键, 'u' 唯一, 'c' CHECK
+	Cols     []int // conkey（列号，主键/唯一）
+	Src      string // consrc（CHECK 表达式文本）
+	Conindid int   // conindid：约束 backing 索引 OID（p/u 约束内联建表时隐式创建的同名索引）
 }
 
 func attrdefFields(t *tuple.HeapTuple) (relid, attnum int, adsrc string) {
@@ -424,11 +445,11 @@ func attrdefFields(t *tuple.HeapTuple) (relid, attnum int, adsrc string) {
 	return
 }
 
-func constraintFields(t *tuple.HeapTuple) (name string, ctype byte, relid int, key []int, src string) {
+func constraintFields(t *tuple.HeapTuple) (name string, ctype byte, relid int, conindid int, key []int, src string) {
 	defer func() { recover() }()
 	fields := heapfile.ExtractFieldsDirect(t.Raw, int(t.HOff), t.GetNulls(), ogConstraintCols)
 	if len(fields) < 26 || fields[0] == nil {
-		return "", 0, 0, nil, ""
+		return "", 0, 0, 0, nil, ""
 	}
 	end := 0
 	for end < len(fields[0]) && fields[0][end] != 0 {
@@ -440,6 +461,10 @@ func constraintFields(t *tuple.HeapTuple) (name string, ctype byte, relid int, k
 	}
 	if fields[6] != nil && len(fields[6]) >= 4 {
 		relid = int(binary.U32(fields[6], 0))
+	}
+	// conindid（布局字段 8）：p/u 约束 backing 索引 OID，CHECK('c') 恒为 0
+	if fields[8] != nil && len(fields[8]) >= 4 {
+		conindid = int(binary.U32(fields[8], 0))
 	}
 	if fields[18] != nil {
 		key = decodeInt2Array(fields[18])
@@ -525,14 +550,14 @@ func LoadConstraints(dbDir string, relOid, pageSize int) []ConstraintInfo {
 		return out
 	}
 	iterateTuples(path, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
-		name, ctype, relid, key, src := constraintFields(t)
+		name, ctype, relid, conindid, key, src := constraintFields(t)
 		if relid != relOid {
 			return true
 		}
 		switch ctype {
 		case 'p', 'u':
 			if len(key) > 0 {
-				out = append(out, ConstraintInfo{Name: name, Type: ctype, Cols: key})
+				out = append(out, ConstraintInfo{Name: name, Type: ctype, Cols: key, Conindid: conindid})
 			}
 		case 'c':
 			if src != "" {
@@ -1040,14 +1065,14 @@ func AutoDiscoverAllTablesOrdered(dbDir string, pageSize int) []*meta.TableMeta 
 	constraintByRel := map[int][]ConstraintInfo{}
 	if cPath := SysFilePath(abs, pgConstraintOID); cPath != "" {
 		iterateTuples(cPath, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
-			name, ctype, relid, key, src := constraintFields(t)
+			name, ctype, relid, conindid, key, src := constraintFields(t)
 			if relid == 0 {
 				return true
 			}
 			switch ctype {
 			case 'p', 'u':
 				if len(key) > 0 {
-					constraintByRel[relid] = append(constraintByRel[relid], ConstraintInfo{Name: name, Type: ctype, Cols: key})
+					constraintByRel[relid] = append(constraintByRel[relid], ConstraintInfo{Name: name, Type: ctype, Cols: key, Conindid: conindid})
 				}
 			case 'c':
 				if src != "" {
@@ -1076,16 +1101,13 @@ func AutoDiscoverAllTablesOrdered(dbDir string, pageSize int) []*meta.TableMeta 
 			TypeNames:  BuildTypeNameMap(abs),
 		}
 		tm.PrimaryKey = primaryKeyCols(constraintByRel[row.oid], cols)
+		// 每个 relfilenode 只返回一次：名字键与 relfilenode 键登记到同一位置（此前重复 append 致调用方双份输出）
 		if _, ok := pos[tm.FullName()]; !ok {
 			pos[tm.FullName()] = len(order)
-			order = append(order, tm)
-		}
-		if row.relfilenode != 0 {
-			k := strconv.Itoa(row.relfilenode)
-			if _, ok := pos[k]; !ok {
-				pos[k] = len(order)
-				order = append(order, tm)
+			if row.relfilenode != 0 {
+				pos[strconv.Itoa(row.relfilenode)] = len(order)
 			}
+			order = append(order, tm)
 		}
 	}
 	return order
@@ -1158,4 +1180,159 @@ func MarshalIndent(v interface{}) ([]byte, error) {
 	s := buf.String()
 	s = strings.TrimSuffix(s, "\n")
 	return []byte(s), nil
+}
+
+// ---- pg_index 宽松解析（v0.2.6，移植自 pg2sql-go varlena 定位法，兼容不同布局）----
+// IndexRow pg_index 行关键字段
+type IndexRow struct {
+	IndexRelID int
+	RelID      int
+	IsUnique   bool
+	IsPrimary  bool
+	Keys       []int
+}
+
+// locateIndkey 在数据区 [18,34) 范围定位第一个合法 varlena 头（indkey 起始偏移，相对 t_hoff）。
+// bool 区（值 0/1）与 padding（0x00）不会产生合法 varlena 头，首个合法头即 indkey。
+func locateIndkey(raw []byte, hoff int) int {
+	start := hoff + 18
+	end := hoff + 34
+	if end > len(raw) {
+		end = len(raw)
+	}
+	for pos := start; pos+4 <= end; pos++ {
+		if raw[pos] == 0 {
+			continue
+		}
+		kind, total, _, _ := binary.VarlenaParse(raw, pos)
+		if kind != "" && total >= 4 {
+			return pos - hoff
+		}
+	}
+	return -1
+}
+
+// indexFields 解析 pg_index 行：indexrelid@0 indrelid@4 indisunique@10 indisprimary@11
+//（openGauss 列序与 PG 不同，经 pg_class 实测校准），indkey 用 varlena 定位。
+func indexFields(t *tuple.HeapTuple) *IndexRow {
+	raw := t.Raw
+	hoff := int(t.HOff)
+	if hoff+15 > len(raw) {
+		return nil
+	}
+	ir := &IndexRow{
+		IndexRelID: int(binary.U32(raw, hoff)),
+		RelID:      int(binary.U32(raw, hoff+4)),
+		IsUnique:   raw[hoff+10] != 0, // openGauss 列4 indisunique
+		IsPrimary:  raw[hoff+11] != 0, // openGauss 列5 indisprimary
+	}
+	pos := locateIndkey(raw, hoff)
+	if pos >= 0 && hoff+pos+4 <= len(raw) {
+		ir.Keys = decodeInt2Array(raw[hoff+pos:])
+	}
+	return ir
+}
+
+// IndexInfo 非主键索引导出信息
+type IndexInfo struct {
+	Name   string
+	Unique bool
+	Keys   []int
+}
+
+// loadBackingIndexOids 返回 reloid 上被 contype in ('p','u') 约束 conindid 引用的索引 OID 集合。
+// 这些索引由 CREATE TABLE 内联 PRIMARY KEY / UNIQUE 约束隐式创建（与约束同名），
+// 导出独立 CREATE [UNIQUE] INDEX 会与内联约束重复建索引，严格导入时报 relation already exists。
+func loadBackingIndexOids(dbDir string, reloid, pageSize int) map[int]bool {
+	skip := map[int]bool{}
+	if reloid == 0 {
+		return skip
+	}
+	path := SysFilePath(dbDir, pgConstraintOID)
+	if path == "" {
+		return skip
+	}
+	iterateTuples(path, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
+		_, ctype, relid, conindid, _, _ := constraintFields(t)
+		if relid == reloid && (ctype == 'p' || ctype == 'u') && conindid != 0 {
+			skip[conindid] = true
+		}
+		return true
+	})
+	return skip
+}
+
+// LoadIndexes 返回目标表（reloid）的非主键索引（含唯一索引）；表达式/部分索引跳过。
+// v0.2.7：除 indisprimary 外，额外跳过被 contype in ('p','u') 约束 conindid 引用的 backing 索引
+//（PK/UNIQUE 约束已内联进 CREATE TABLE，其同名隐式索引不再重复 emit 独立 CREATE INDEX）。
+func LoadIndexes(dbDir string, reloid int, pageSize int) []IndexInfo {
+	var out []IndexInfo
+	if reloid == 0 {
+		return out
+	}
+	// indexrelid → 索引名（pg_class），同时取 pg_index 的实时 relfilenode
+	//（openGauss 运行中 relmapper 刷盘可能滞后，以 pg_class.relfilenode 为准）
+	idxName := map[int]string{}
+	idxRfn := 0
+	classPath := SysFilePath(dbDir, pgClassOID)
+	if classPath == "" {
+		return out
+	}
+	iterateTuples(classPath, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
+		if row := classFields(t); row != nil && row.oid != 0 {
+			idxName[row.oid] = row.relname
+			if row.oid == pgIndexOID && row.relfilenode != 0 {
+				idxRfn = row.relfilenode
+			}
+		}
+		return true
+	})
+	if idxRfn == 0 {
+		return out
+	}
+	// 约束（PK/UNIQUE）backing 索引 OID 集合：内联约束已隐式建同名索引，不再独立导出
+	backing := loadBackingIndexOids(dbDir, reloid, pageSize)
+	p := filepath.Join(dbDir, strconv.Itoa(idxRfn))
+	iterateTuples(p, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
+		ir := indexFields(t)
+		if ir == nil || ir.RelID != reloid || ir.IsPrimary {
+			return true
+		}
+		if backing[ir.IndexRelID] {
+			return true // p/u 约束 backing 索引（已内联进 CREATE TABLE），跳过独立 CREATE INDEX
+		}
+		if len(ir.Keys) == 0 {
+			return true
+		}
+		name := idxName[ir.IndexRelID]
+		if name == "" {
+			return true
+		}
+		out = append(out, IndexInfo{Name: name, Unique: ir.IsUnique, Keys: ir.Keys})
+		return true
+	})
+	return out
+}
+
+// SequenceInfo 序列对象
+type SequenceInfo struct {
+	Schema string
+	Name   string
+}
+
+// LoadSequences 返回本库全部序列（pg_class relkind='S'），OID → (schema, name)。
+func LoadSequences(dbDir string, pageSize int) map[int]SequenceInfo {
+	out := map[int]SequenceInfo{}
+	nsMap := loadNSMap(dbDir)
+	iterateTuples(SysFilePath(dbDir, pgClassOID), pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
+		if row := classFields(t); row != nil && row.relkind == "S" {
+			schema := nsMap[row.relns]
+			if schema == "" {
+				schema = "public"
+			}
+			out[row.oid] = SequenceInfo{Schema: schema, Name: row.relname}
+		}
+		return true
+	})
+	return out
 }

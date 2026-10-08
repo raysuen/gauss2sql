@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gauss2sql-go/internal/binary"
 )
@@ -51,6 +52,37 @@ const (
 	UuidOID      = 2950
 	JsonbOID     = 3802
 	AclitemOID   = 1033
+	// openGauss 缺口类型（v0.2.6 补全，OID 与 PostgreSQL 同源）
+	PointOID        = 600
+	LsegOID         = 601
+	PathOID         = 602
+	BoxOID          = 603
+	PolygonOID      = 604
+	LineOID         = 628
+	CircleOID       = 718
+	Macaddr8OID     = 774
+	XmlOID          = 142
+	RegprocOID      = 24
+	RegprocedureOID = 2202
+	RegoperOID      = 2203
+	RegoperatorOID  = 2204
+	RegclassOID     = 2205
+	RegtypeOID      = 2206
+	RegconfigOID    = 3734
+	RegdictionaryOID = 3769
+	RegnamespaceOID = 4089
+	RegroleOID      = 4096
+	RegcollationOID = 4191
+	PgLsnOID        = 3220
+	TsvectorOID     = 3614
+	TsqueryOID      = 3615
+	Int4RangeOID    = 3904
+	NumRangeOID     = 3906
+	TsRangeOID      = 3908
+	TstzRangeOID    = 3910
+	DateRangeOID    = 3912
+	Int8RangeOID    = 3926
+	TxidSnapshotOID = 2970 // openGauss txid_snapshot（PG 为 5030，openGauss 为 2970）
 )
 
 // TypeNames 内置类型名（pg_type 未命中时兜底）
@@ -383,14 +415,20 @@ func decodeTimetz(b []byte) string {
 	us := binary.I64(b, 0)
 	zone := binary.I32(b, 8)
 	t := timeFromUS(us)
+	// openGauss timetz 磁盘 zone（秒）与 PG 符号相反（经 timetz_send 权威字节实测）：
+	// '10:00:00-05' 磁盘存 +18000、'-05:30' 存 +19800、'+05' 存 -18000。
+	// 显示：zone>0 → '-HH'，zone<0 → '+HH'；整点省略 ':00'（openGauss timetz_out 格式）。
 	sign := "-"
 	if zone < 0 {
 		sign = "+"
-	}
-	if zone < 0 {
 		zone = -zone
 	}
-	return fmt.Sprintf("%s%s%02d:%02d", t, sign, zone/3600, (zone%3600)/60)
+	h := zone / 3600
+	m := (zone % 3600) / 60
+	if m != 0 {
+		return fmt.Sprintf("%s%s%02d:%02d", t, sign, h, m)
+	}
+	return fmt.Sprintf("%s%s%02d", t, sign, h)
 }
 
 func decodeInterval(b []byte) string {
@@ -741,6 +779,9 @@ func decodeBit(b []byte) string {
 	}
 	nbits := binary.I32(p, 0)
 	data := p[4:]
+	if int(nbits) > len(data)*8 || nbits < 0 {
+		return "" // 损坏数据：位数超过实际字节，避免越界 panic
+	}
 	var sb strings.Builder
 	for i := 0; i < int(nbits); i++ {
 		by := data[i/8]
@@ -755,6 +796,9 @@ func decodeBit(b []byte) string {
 
 func decodeMoney(b []byte) string {
 	v := binary.I64(b, 0)
+	if v == math.MinInt64 {
+		return "-92233720368547758.08" // MinInt64 取负溢出，特判（与 PG money_out 一致）
+	}
 	sign := ""
 	if v < 0 {
 		sign = "-"
@@ -855,11 +899,15 @@ func arrayElemText(payload []byte, pos int, elemOid int) (string, int) {
 	return binary.DecodeBytes(seg), pos + alen
 }
 
+// sqlNullMarker 数组 SQL NULL 元素哨兵（\x00 开头，SQL 文本不可能含 \x00，避免与字面量碰撞）
+const sqlNullMarker = "\x00GN\x00"
+
 func arrayQuote(s string) string {
-	if s == "NULL" {
-		return s
+	if s == sqlNullMarker {
+		return "NULL" // SQL NULL 元素（无引号），区别于字符串 "NULL"（带引号）
 	}
-	needs := s == ""
+	// openGauss array_out 对字面量 "NULL" 加引号（{"NULL",...}）；裸 NULL 会被 array_in 解析为 SQL NULL 元素
+	needs := s == "" || s == "NULL"
 	if !needs {
 		for _, ch := range s {
 			if ch == ',' || ch == '{' || ch == '}' || ch == '"' || ch == '\\' {
@@ -907,10 +955,16 @@ func decodeArray(b []byte) string {
 		nelems *= d
 	}
 	bodyOff := 12 + 8*ndim
+	if nelems <= 0 || nelems > 1<<24 {
+		return "{}" // 维长乘积异常（损坏数据），避免位图/元素循环越界
+	}
 	var nulls []bool
 	var elemOff int
 	if dataoffset > 0 {
 		bmLen := (nelems + 7) / 8
+		if bodyOff+bmLen > len(p) {
+			return "{}" // NULL 位图越界（损坏数据）
+		}
 		bm := p[bodyOff : bodyOff+bmLen]
 		nulls = make([]bool, nelems)
 		for i := 0; i < nelems; i++ {
@@ -929,7 +983,7 @@ func decodeArray(b []byte) string {
 	corrupt := false
 	for i := 0; i < nelems; i++ {
 		if nulls != nil && nulls[i] {
-			texts = append(texts, "NULL")
+			texts = append(texts, sqlNullMarker)
 			continue
 		}
 		t, np, err := safeElemText(p, pos, elemtype)
@@ -1007,11 +1061,13 @@ func formatNested(v interface{}) string {
 	return "{}"
 }
 
-func safeElemText(payload []byte, pos int, elemOid int) (string, int, error) {
+func safeElemText(payload []byte, pos int, elemOid int) (t string, np int, err error) {
 	defer func() {
-		recover()
+		if r := recover(); r != nil {
+			t, np, err = "", 0, fmt.Errorf("array element corrupt at pos %d: %v", pos, r)
+		}
 	}()
-	t, np := arrayElemText(payload, pos, elemOid)
+	t, np = arrayElemText(payload, pos, elemOid)
 	return t, np, nil
 }
 
@@ -1127,6 +1183,37 @@ func DecodeValue(oid int, raw []byte) string {
 		s = decodeChar(raw)
 	case 9003:
 		s = decodeSmalldatetime(raw)
+	case RegprocOID, RegprocedureOID, RegoperOID, RegoperatorOID, RegclassOID,
+		RegtypeOID, RegconfigOID, RegdictionaryOID, RegnamespaceOID, RegroleOID, RegcollationOID:
+		s = decodeRegOid(raw)
+	case PgLsnOID:
+		s = decodePgLsn(raw)
+	case TxidSnapshotOID:
+		s = decodeTxidSnapshot(raw)
+	case TsvectorOID:
+		s = decodeTsvector(raw)
+	case TsqueryOID:
+		s = decodeTsquery(raw)
+	case PointOID:
+		s = decodePoint(raw)
+	case LsegOID:
+		s = decodeLseg(raw)
+	case BoxOID:
+		s = decodeBox(raw)
+	case PathOID:
+		s = decodePath(raw)
+	case PolygonOID:
+		s = decodePolygon(raw)
+	case LineOID:
+		s = decodeLine(raw)
+	case CircleOID:
+		s = decodeCircle(raw)
+	case Macaddr8OID:
+		s = decodeMacaddr8(raw)
+	case XmlOID:
+		s = decodeXml(raw)
+	case Int4RangeOID, Int8RangeOID, NumRangeOID, DateRangeOID, TsRangeOID, TstzRangeOID:
+		s = decodeRange(raw, oid)
 	default:
 		if _, isArr := arrayTypeSet[oid]; isArr {
 			s = decodeArray(raw)
@@ -1150,3 +1237,425 @@ var arrayTypeSet = map[int]bool{
 }
 
 var _ = binary.U16
+
+// ---- openGauss 缺口类型：range / tsvector / tsquery / 几何 / pg_lsn / txid_snapshot / reg* / xml / macaddr8 ----
+// 移植自 pg2sql-go types.go（Author: raysuen），磁盘格式与 PostgreSQL/openGauss 同源。
+
+// ---- range 子类型 ----
+type rangeSub struct {
+	wid int                 // 定长子类型宽度（0=变长 varlena 内嵌）
+	dec func([]byte) string // 子类型解码器（接收含 varlena 头的段）
+}
+
+var rangeSubtypes = map[int]rangeSub{
+	Int4RangeOID: {4, decodeInt4},        // int4range
+	Int8RangeOID: {8, decodeInt8},        // int8range
+	NumRangeOID:  {0, decodeNumeric},     // numrange（numeric 为 varlena）
+	DateRangeOID: {4, decodeDate},        // daterange
+	TsRangeOID:   {8, decodeTimestamp},   // tsrange
+	TstzRangeOID: {8, decodeTstz},        // tstzrange
+}
+
+// decodeRange：openGauss 范围类型 varlena（与 PG rangetypes.h 同源）。
+// 磁盘：range 自身 oid(4B) + lower + upper + 1B flags（变长子类型带 varlena 长度前缀）。
+// flags: 0x01 EMPTY 0x02 LB_INC 0x04 UB_INC 0x08 LB_INF 0x10 UB_INF 0x20 LB_NULL 0x40 UB_NULL。
+// 输出与 range_out 一致：empty / [1,10) / (,10] / [1,) 等。
+func decodeRange(b []byte, oid int) string {
+	sub, ok := rangeSubtypes[oid]
+	if !ok {
+		return decodeText(b)
+	}
+	p, _, _ := varPayload(b)
+	if len(p) < 5 {
+		return decodeText(b)
+	}
+	p = p[4:] // 剥 range 自身 oid 头
+	flags := p[len(p)-1]
+	if flags&0x01 != 0 {
+		return "empty"
+	}
+	var lo, hi []byte
+	pos := 0
+	if flags&0x08 != 0 {
+		lo = nil
+	} else if pos < len(p)-1 {
+		if sub.wid > 0 {
+			if pos+sub.wid > len(p)-1 {
+				return decodeText(b) // 定长子类型越界（损坏数据）
+			}
+			lo = p[pos : pos+sub.wid]
+			pos += sub.wid
+		} else {
+			kind, total, _, _ := binary.VarlenaParse(p, pos)
+			if kind != "" && total > 0 && pos+total <= len(p)-1 {
+				lo = p[pos : pos+total] // 含 varlena 头，decodeNumeric 内部剥
+				pos += total
+			}
+		}
+	}
+	if flags&0x10 != 0 {
+		hi = nil
+	} else if pos < len(p)-1 {
+		if sub.wid > 0 {
+			if pos+sub.wid > len(p)-1 {
+				return decodeText(b)
+			}
+			hi = p[pos : pos+sub.wid]
+		} else {
+			kind, total, _, _ := binary.VarlenaParse(p, pos)
+			if kind != "" && total > 0 && pos+total <= len(p)-1 {
+				hi = p[pos : pos+total]
+			}
+		}
+	}
+	var sb strings.Builder
+	if flags&0x02 != 0 {
+		sb.WriteByte('[')
+	} else {
+		sb.WriteByte('(')
+	}
+	if lo != nil {
+		sb.WriteString(sub.dec(lo))
+	}
+	sb.WriteByte(',')
+	if hi != nil {
+		sb.WriteString(sub.dec(hi))
+	}
+	if flags&0x04 != 0 {
+		sb.WriteByte(']')
+	} else {
+		sb.WriteByte(')')
+	}
+	return sb.String()
+}
+
+// decodeTsvector：tsvector varlena（与 PG tsvector.h 同源）。
+// WordEntry 位打包：haspos(bit0)/len(11bit)/pos(20bit)；data 区连续词；WEP 权重 3→A/2→B/1→C/0 不显示。
+func decodeTsvector(b []byte) string {
+	p, _, _ := varPayload(b)
+	b2 := p
+	if len(b2) < 4 {
+		return decodeText(b)
+	}
+	size := int32(binary.U32(b2, 0))
+	if size < 0 || 4+int(size)*4 > len(b2) {
+		return decodeText(b)
+	}
+	cur := 4 + int(size)*4
+	var parts []string
+	for i := 0; i < int(size); i++ {
+		e := binary.U32(b2, 4+i*4)
+		haspos := e & 1
+		l := int((e >> 1) & 0x7FF)
+		if cur+l > len(b2) {
+			break
+		}
+		w := string(b2[cur : cur+l])
+		if !utf8.ValidString(w) {
+			w = "\\x" + hex.EncodeToString(b2[cur:cur+l]) // 非法 UTF-8 词：hex 标记，避免 � 静默失真
+		}
+		cur += l
+		if haspos != 0 {
+			if cur&1 != 0 {
+				cur++
+			}
+			if cur+2 > len(b2) {
+				break
+			}
+			np := int(binary.U16(b2, cur))
+			cur += 2
+			var poss []string
+			for j := 0; j < np && cur+2 <= len(b2); j++ {
+				p16 := binary.U16(b2, cur)
+				cur += 2
+				p := p16 & 0x3FFF
+				wgt := p16 >> 14
+				s := strconv.Itoa(int(p))
+				switch wgt {
+				case 1:
+					s += "C"
+				case 2:
+					s += "B"
+				case 3:
+					s += "A"
+				}
+				poss = append(poss, s)
+			}
+			wEsc := strings.Replace(w, "'", "''", -1)
+			parts = append(parts, "'"+wEsc+"':"+strings.Join(poss, ","))
+		} else {
+			wEsc := strings.Replace(w, "'", "''", -1)
+			parts = append(parts, "'"+wEsc+"'")
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// decodeTsquery：tsquery varlena（与 PG tsquery.h 同源）。
+// QueryItem 12B/个：QI_VAL(词) / QI_OPR(运算)；NOT/AND/OR/PHRASE 优先级与 PG infix 一致。
+func decodeTsquery(b []byte) string {
+	p, _, _ := varPayload(b)
+	if len(p) < 8 {
+		return decodeText(b)
+	}
+	size := int(int32(binary.U32(p, 0)))
+	if size <= 0 {
+		return ""
+	}
+	itemsStart := 4
+	itemsEnd := itemsStart + 12*size
+	if itemsEnd > len(p) {
+		return decodeText(b)
+	}
+	operands := p[itemsEnd:]
+	curPos := 0
+	var sb strings.Builder
+	var infix func(out *strings.Builder, parentPriority int, rightPhraseOp bool)
+	infix = func(out *strings.Builder, parentPriority int, rightPhraseOp bool) {
+		if curPos >= size {
+			return
+		}
+		item := p[itemsStart+12*curPos : itemsStart+12*curPos+12]
+		typ := item[0]
+		switch typ {
+		case 1: // QI_VAL
+			weight := item[1]
+			prefix := item[2]
+			wordBits := binary.U32(item, 8)
+			length := wordBits & 0xFFF
+			distance := wordBits >> 12
+			if int(distance)+int(length) > len(operands) {
+				curPos++
+				return
+			}
+			op := operands[distance : distance+length]
+			out.WriteByte('\'')
+			for _, ch := range op {
+				if ch == '\'' {
+					out.WriteByte(ch)
+				}
+				out.WriteByte(ch)
+			}
+			out.WriteByte('\'')
+			if weight != 0 || prefix != 0 {
+				out.WriteByte(':')
+				if prefix != 0 {
+					out.WriteByte('*')
+				}
+				if weight&8 != 0 {
+					out.WriteByte('A')
+				}
+				if weight&4 != 0 {
+					out.WriteByte('B')
+				}
+				if weight&2 != 0 {
+					out.WriteByte('C')
+				}
+				if weight&1 != 0 {
+					out.WriteByte('D')
+				}
+			}
+			curPos++
+		case 2: // QI_OPR
+			oper := item[1]
+			priority := 0
+			switch oper {
+			case 1: // OP_NOT
+				priority = 4
+			case 2: // OP_AND
+				priority = 2
+			case 3: // OP_OR
+				priority = 1
+			case 4: // OP_PHRASE
+				priority = 3
+			}
+			distance := int(int16(binary.U16(item, 2)))
+			needParen := priority < parentPriority || (oper == 4 && rightPhraseOp)
+			if needParen {
+				out.WriteString("( ")
+			}
+			curPos++
+			if oper == 1 {
+				out.WriteByte('!')
+				infix(out, priority, false)
+			} else {
+				var rightBuf strings.Builder
+				infix(&rightBuf, priority, oper == 4) // right
+				infix(out, priority, false)           // left
+				switch oper {
+				case 2:
+					out.WriteString(" & ")
+				case 3:
+					out.WriteString(" | ")
+				case 4:
+					if distance != 1 {
+						out.WriteString(fmt.Sprintf(" <%d> ", distance))
+					} else {
+						out.WriteString(" <-> ")
+					}
+				}
+				out.WriteString(rightBuf.String())
+			}
+			if needParen {
+				out.WriteString(" )")
+			}
+		default:
+			curPos++
+		}
+	}
+	infix(&sb, -1, false)
+	return sb.String()
+}
+
+// decodePgLsn：pg_lsn（oid 3220，8B 小端）。输出与 pg_lsn_out 一致：高 32 位/低 32 位大写 hex。
+func decodePgLsn(b []byte) string {
+	if len(b) < 8 {
+		return decodeText(b)
+	}
+	v := binary.U64(b, 0)
+	return fmt.Sprintf("%X/%X", uint32(v>>32), uint32(v))
+}
+
+// decodeTxidSnapshot：txid_snapshot（oid 2970，openGauss）varlena。
+// 磁盘（openGauss，经 txid_snapshot_send 权威校准）：[nxip int32][xmin int64][xmax int64][extra int64恒0][xip int64...]，
+// 总长 28+8n；与 PG 不同（PG 无 extra 8B）。输出固定 "xmin:xmax:"（尾冒号必须保留），xip 逗号分隔。
+func decodeTxidSnapshot(b []byte) string {
+	p, _, _ := varPayload(b)
+	// openGauss txid_snapshot 布局（经 txid_snapshot_send 权威校准）：
+	// [nxip int32][xmin int64][xmax int64][extra int64(恒0)][xip int64...]
+	//（与 PG 不同：PG 为 [nxip][xmin8][xmax8][xip8] 且无 extra；openGauss xid 为 64 位）
+	if len(p) < 28 {
+		return decodeText(b)
+	}
+	nxip := binary.U32(p, 0)
+	xmin := binary.U64(p, 4)
+	xmax := binary.U64(p, 12)
+	var sb strings.Builder
+	sb.WriteString(strconv.FormatUint(xmin, 10))
+	sb.WriteByte(':')
+	sb.WriteString(strconv.FormatUint(xmax, 10))
+	sb.WriteByte(':')
+	for i := 0; i < int(nxip) && 28+8*i+8 <= len(p); i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(strconv.FormatUint(binary.U64(p, 28+8*i), 10))
+	}
+	return sb.String()
+}
+
+// decodeRegOid：reg* 系列（int4 byval，磁盘为 4B oid 小端）。输出 oid 数字（可逆导入）。
+func decodeRegOid(b []byte) string {
+	if len(b) < 4 {
+		return decodeText(b)
+	}
+	return strconv.FormatUint(uint64(binary.U32(b, 0)), 10)
+}
+
+// decodeXml：xml varlena。PG 标准内容带 4B 类型标记，openGauss 同为 PG 布局。
+func decodeXml(b []byte) string {
+	p, _, _ := varPayload(b)
+	if len(p) >= 5 && p[0] <= 1 && p[1] == 0 && p[2] == 0 && p[3] == 0 {
+		p = p[4:]
+	}
+	if utf8.Valid(p) {
+		return string(p)
+	}
+	return "\\x" + hex.EncodeToString(p)
+}
+
+// decodeMacaddr8：macaddr8（oid 774，8B）。输出 xx:xx:xx:xx:xx:xx:xx:xx。
+func decodeMacaddr8(b []byte) string {
+	if len(b) < 8 {
+		return ""
+	}
+	parts := make([]string, 8)
+	for i := 0; i < 8; i++ {
+		parts[i] = fmt.Sprintf("%02x", b[i])
+	}
+	return strings.Join(parts, ":")
+}
+
+// ---- 几何类型（与 PG geo_decls.h 同源，全部小端 double）----
+func geomPt(b []byte, off int) string {
+	x := math.Float64frombits(binary.U64(b, off))
+	y := math.Float64frombits(binary.U64(b, off+8))
+	return fmt.Sprintf("(%s,%s)", fmtFloat(x), fmtFloat(y))
+}
+
+func decodePoint(b []byte) string {
+	if len(b) < 16 {
+		return ""
+	}
+	return geomPt(b, 0)
+}
+
+func decodeLseg(b []byte) string {
+	if len(b) < 32 {
+		return ""
+	}
+	return fmt.Sprintf("[%s,%s]", geomPt(b, 0), geomPt(b, 16))
+}
+
+func decodeBox(b []byte) string {
+	if len(b) < 32 {
+		return ""
+	}
+	return fmt.Sprintf("%s,%s", geomPt(b, 0), geomPt(b, 16))
+}
+
+func decodePath(b []byte) string {
+	p, _, _ := varPayload(b)
+	if len(p) < 12 {
+		return ""
+	}
+	npts := int(int32(binary.U32(p, 0)))
+	closed := int32(binary.U32(p, 4))
+	if npts <= 0 || len(p) < 12+16*npts {
+		return ""
+	}
+	pts := make([]string, npts)
+	for i := 0; i < npts; i++ {
+		pts[i] = geomPt(p, 12+16*i)
+	}
+	if closed != 0 {
+		return "(" + strings.Join(pts, ",") + ")"
+	}
+	return "[" + strings.Join(pts, ",") + "]"
+}
+
+func decodePolygon(b []byte) string {
+	p, _, _ := varPayload(b)
+	if len(p) < 36 {
+		return ""
+	}
+	npts := int(int32(binary.U32(p, 0)))
+	if npts <= 0 || len(p) < 36+16*npts {
+		return ""
+	}
+	pts := make([]string, npts)
+	for i := 0; i < npts; i++ {
+		pts[i] = geomPt(p, 36+16*i)
+	}
+	return "(" + strings.Join(pts, ",") + ")"
+}
+
+func decodeLine(b []byte) string {
+	if len(b) < 24 {
+		return ""
+	}
+	a := math.Float64frombits(binary.U64(b, 0))
+	bb := math.Float64frombits(binary.U64(b, 8))
+	c := math.Float64frombits(binary.U64(b, 16))
+	return fmt.Sprintf("{%s,%s,%s}", fmtFloat(a), fmtFloat(bb), fmtFloat(c))
+}
+
+func decodeCircle(b []byte) string {
+	if len(b) < 24 {
+		return ""
+	}
+	x := math.Float64frombits(binary.U64(b, 0))
+	y := math.Float64frombits(binary.U64(b, 8))
+	r := math.Float64frombits(binary.U64(b, 16))
+	return fmt.Sprintf("<(%s,%s),%s>", fmtFloat(x), fmtFloat(y), fmtFloat(r))
+}

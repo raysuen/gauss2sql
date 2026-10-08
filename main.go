@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,19 +21,25 @@ import (
 	"gauss2sql-go/internal/types"
 )
 
-var version = "0.2.5"
+var version = "0.2.11"
 
 type options struct {
 	dataPath      string
 	datadir       string
 	listDB        bool
 	listTablesDB  bool
+	listTablesAll bool
 	exportMeta    bool
+	tables        bool
+	allTables     bool
+	schema        string
 	ddl           bool
 	sql           bool
 	data          bool
 	output        string
 	parallel      int
+	limit         int
+	delimiter     string
 	deleted       bool
 	onlyDeleted   bool
 	count         bool
@@ -47,7 +54,16 @@ type options struct {
 
 func parseArgs() *options {
 	o := &options{}
+	var v string
 	args := os.Args[1:]
+	// argVal：安全取选项值；缺参数（选项在末尾）时报错退出而非越界 panic
+	argVal := func(args []string, i int, name string) (string, int) {
+		if i+1 >= len(args) {
+			fmt.Fprintf(os.Stderr, "error: 选项 %s 缺少参数值\n", name)
+			os.Exit(2)
+		}
+		return args[i+1], i + 1
+	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch a {
@@ -55,8 +71,16 @@ func parseArgs() *options {
 			o.listDB = true
 		case "--list-tables-db":
 			o.listTablesDB = true
+		case "--list-tables-all":
+			o.listTablesAll = true
 		case "--export-meta":
 			o.exportMeta = true
+		case "--tables":
+			o.tables = true
+		case "--all-tables":
+			o.allTables = true
+		case "--schema":
+			o.schema, i = argVal(args, i, a)
 		case "--ddl":
 			o.ddl = true
 		case "--sql":
@@ -79,26 +103,25 @@ func parseArgs() *options {
 		case "--version":
 			o.showVersion = true
 		case "--datadir":
-			i++
-			o.datadir = args[i]
+			o.datadir, i = argVal(args, i, a)
 		case "--output", "-o":
-			i++
-			o.output = args[i]
+			o.output, i = argVal(args, i, a)
 		case "--parallel", "-j":
-			i++
-			o.parallel, _ = strconv.Atoi(args[i])
+			v, i = argVal(args, i, a)
+			o.parallel, _ = strconv.Atoi(v)
+		case "--limit":
+			v, i = argVal(args, i, a)
+			o.limit, _ = strconv.Atoi(v)
+		case "--delimiter":
+			o.delimiter, i = argVal(args, i, a)
 		case "--fields":
-			i++
-			o.fields = args[i]
+			o.fields, i = argVal(args, i, a)
 		case "--encoding":
-			i++
-			o.encoding = args[i]
+			o.encoding, i = argVal(args, i, a)
 		case "--catalog-json":
-			i++
-			o.catalogJSON = args[i]
+			o.catalogJSON, i = argVal(args, i, a)
 		case "--table-name":
-			i++
-			o.tableName = args[i]
+			o.tableName, i = argVal(args, i, a)
 		default:
 			if !strings.HasPrefix(a, "-") && o.dataPath == "" {
 				o.dataPath = a
@@ -110,6 +133,9 @@ func parseArgs() *options {
 
 func main() {
 	o := parseArgs()
+	if o.delimiter == "" {
+		o.delimiter = "," // --delimiter 默认逗号（与 COPY DELIMITER 语义一致）
+	}
 	if o.showVersion {
 		fmt.Printf("gauss2sql-go %s (Author: raysuen)\n", version)
 		return
@@ -135,11 +161,19 @@ func main() {
 		os.Exit(1)
 	}
 	if o.listTablesDB {
-		listTablesDB(abs)
+		listTablesDB(abs, false)
+		return
+	}
+	if o.listTablesAll {
+		listTablesDB(abs, true)
 		return
 	}
 	if o.exportMeta {
 		exportMeta(abs, o)
+		return
+	}
+	if o.tables || o.allTables || o.schema != "" {
+		exportDBAll(abs, o)
 		return
 	}
 
@@ -153,8 +187,41 @@ func main() {
 	if o.encoding != "" {
 		binary.SetTextEncoding(o.encoding)
 	}
-
 	catalog.LoadEnumMap(dbDir)
+	out, nRows, tm := dumpOneTable(abs, o)
+	if o.count {
+		fmt.Print(out)
+		return
+	}
+	ext := "sql"
+	if o.data {
+		ext = "csv"
+	}
+	outPath := resolveOutput(o.output, tm, ext)
+	start := time.Now()
+	writeOutput(outPath, out)
+	if o.verbose {
+		mode := "sql"
+		if o.data {
+			mode = "csv"
+		}
+		if o.ddl && !o.data {
+			mode = "ddl+sql"
+		}
+		vlog(o, "模式: %s (parallel=%d, encoding=%s)", mode, o.parallel, binary.GetTextEncoding())
+		if outPath == "" {
+			vlog(o, "输出到: 标准输出")
+		} else {
+			vlog(o, "输出到: %s", outPath)
+		}
+		vlog(o, "完成: %d 行, 耗时 %.2fs", nRows, time.Since(start).Seconds())
+	}
+}
+
+// dumpOneTable 导出单表内容（DDL/SQL/CSV/count），返回输出内容与行数。
+// 编码探测与枚举加载由调用方在进入前完成（全局幂等）。
+func dumpOneTable(abs string, o *options) (string, int, *meta.TableMeta) {
+	dbDir := filepath.Dir(abs)
 
 	var tm *meta.TableMeta
 	if o.catalogJSON != "" {
@@ -193,12 +260,11 @@ func main() {
 	}
 
 	if o.count {
-		rows := hf.DumpRows(tm, o.deleted, o.onlyDeleted, 0)
+		rows := hf.DumpRows(tm, o.deleted, o.onlyDeleted, o.limit)
 		if o.verbose {
 			fmt.Fprintf(os.Stderr, "[verbose] 统计完成: %d 行\n", len(rows))
 		}
-		fmt.Printf("-- 总行数: %d\n", len(rows))
-		return
+		return fmt.Sprintf("-- 总行数: %d\n", len(rows)), len(rows), tm
 	}
 
 	fields := parseFields(o.fields)
@@ -223,53 +289,178 @@ func main() {
 	}
 
 	var out strings.Builder
+	var nRows int
 	if o.ddl {
 		out.WriteString(buildDDL(tm, dbDir))
 		out.WriteString("\n\n")
 	}
 	if o.sql {
-		for _, s := range hf.ToSQL(tm, o.deleted, o.onlyDeleted, 0, true, false, fields) {
+		lines := hf.ToSQL(tm, o.deleted, o.onlyDeleted, o.limit, true, false, fields)
+		for _, s := range lines {
+			out.WriteString(s)
+			out.WriteString("\n")
+		}
+		nRows = len(lines)
+		// setval 序列同步（数据导入后执行，自增列不冲突）
+		for _, s := range buildSetvalStmts(tm, dbDir) {
 			out.WriteString(s)
 			out.WriteString("\n")
 		}
 	}
 	if o.data {
-		for _, line := range hf.ToData(tm, o.deleted, o.onlyDeleted, 0, ",", fields, o.header) {
+		lines := hf.ToData(tm, o.deleted, o.onlyDeleted, o.limit, o.delimiter, fields, o.header)
+		for _, line := range lines {
 			out.WriteString(line)
 			out.WriteString("\n")
 		}
+		nRows = len(lines)
 	}
+	return out.String(), nRows, tm
+}
+
+// exportDBAll 批量导出数据库（或 --schema 过滤的 schema）下所有普通表（对齐 pg2sql --tables/--all-tables）。
+// 位置参数为数据库目录（如 base/16388）；必须指定 -o 输出目录且 --sql/--data/--ddl 之一；
+// 每表一个 <schema>.<对象名>.<sql|csv|ddl> 文件；--all-tables 时包含系统 schema。
+func exportDBAll(dbDir string, o *options) {
+	if !o.sql && !o.data && !o.ddl {
+		fmt.Fprintln(os.Stderr, "--tables/--all-tables/--schema 批量导出必须指定 --sql 或 --data（纯 DDL 用 --ddl）")
+		os.Exit(2)
+	}
+	if o.output == "" {
+		fmt.Fprintln(os.Stderr, "--tables/--all-tables/--schema 批量导出必须指定输出目录（-o 目录）")
+		os.Exit(2)
+	}
+	if !o.count {
+		if fi, err := os.Stat(o.output); err != nil || !fi.IsDir() {
+			fmt.Fprintln(os.Stderr, "-o 必须是已存在的目录:", o.output)
+			os.Exit(2)
+		}
+	}
+	dbOid, _ := strconv.Atoi(filepath.Base(dbDir))
+	if enc := catalog.DetectDatabaseEncoding(filepath.Dir(filepath.Dir(dbDir)), dbOid); enc != "" {
+		binary.SetTextEncoding(enc)
+	}
+	if o.encoding != "" {
+		binary.SetTextEncoding(o.encoding)
+	}
+	catalog.LoadEnumMap(dbDir)
+
+	tables := catalog.AutoDiscoverAllTablesOrdered(dbDir, 0)
+	schemaSet := map[string]bool{}
+	if o.schema != "" {
+		for _, s := range strings.Split(o.schema, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				schemaSet[s] = true
+			}
+		}
+	}
+	var list []*meta.TableMeta
+	for _, tm := range tables {
+		if tm.Relkind != "r" { // 仅普通表（含分区子分区），跳过索引/序列/TOAST/视图
+			continue
+		}
+		if len(schemaSet) > 0 {
+			if !schemaSet[tm.Schema] {
+				continue
+			}
+		} else if !o.allTables && isSystemSchema(tm.Schema) { // --all-tables 才包含系统 schema
+			continue
+		}
+		list = append(list, tm)
+	}
+	if len(list) == 0 {
+		fmt.Fprintln(os.Stderr, "error: 未发现可导出的普通表（指定 --schema 或检查数据库目录）")
+		os.Exit(1)
+	}
+	// 确定性输出顺序
+	sort.Slice(list, func(i, j int) bool { return list[i].FullName() < list[j].FullName() })
 
 	ext := "sql"
 	if o.data {
 		ext = "csv"
+	} else if o.ddl && !o.sql {
+		ext = "ddl"
 	}
-	outPath := resolveOutput(o.output, tm, ext)
+
 	start := time.Now()
-	var nRows int
-	if o.sql || o.ddl {
-		nRows = len(hf.ToSQL(tm, o.deleted, o.onlyDeleted, 0, true, false, fields))
+	total := 0
+	for _, tm := range list {
+		abs := filepath.Join(dbDir, strconv.Itoa(tm.Relfilenode))
+		if _, err := os.Stat(abs); err != nil {
+			// 数据文件缺失（如已 VACUUM FULL 换文件）：跳过并警告，不中断整个批量
+			fmt.Fprintf(os.Stderr, "warning: 跳过 %s.%s（数据文件不存在: %s）\n", tm.Schema, tm.Relname, abs)
+			continue
+		}
+		out, nRows, _ := dumpOneTable(abs, o)
+		total += nRows
+		if o.count {
+			fmt.Printf("-- %s.%s: %d 行\n", tm.Schema, tm.Relname, nRows)
+			continue
+		}
+		path := filepath.Join(o.output, defaultOutName(tm, ext))
+		writeOutput(path, out)
+		vlog(o, "已导出: %s (%d 行)", path, nRows)
 	}
-	if o.data {
-		nRows = len(hf.ToData(tm, o.deleted, o.onlyDeleted, 0, ",", fields, o.header))
-	}
-	writeOutput(outPath, out.String())
 	if o.verbose {
-		mode := "sql"
-		if o.data {
-			mode = "csv"
-		}
-		if o.ddl && !o.data {
-			mode = "ddl+sql"
-		}
-		vlog(o, "模式: %s (parallel=%d, encoding=%s)", mode, o.parallel, binary.GetTextEncoding())
-		if outPath == "" {
-			vlog(o, "输出到: 标准输出")
-		} else {
-			vlog(o, "输出到: %s", outPath)
-		}
-		vlog(o, "完成: %d 行, 耗时 %.2fs", nRows, time.Since(start).Seconds())
+		vlog(o, "批量导出完成: %d 张表, %d 行, 耗时 %.2fs", len(list), total, time.Since(start).Seconds())
 	}
+}
+
+// isSystemSchema 判断 openGauss 系统 schema（默认 --export-db 时排除）。
+// 系统 schema：pg_* 前缀、information_schema、openGauss 扩展 dbe_*/coverage/db4ai/snapshot。
+func isSystemSchema(s string) bool {
+	if strings.HasPrefix(s, "pg_") || strings.HasPrefix(s, "dbe_") {
+		return true
+	}
+	switch s {
+	case "information_schema", "coverage", "db4ai", "snapshot":
+		return true
+	}
+	return false
+}
+
+// buildSetvalStmts 生成 setval 序列同步语句（在数据导入后执行，自增列从当前最大值继续）。
+// 仅处理 DEFAULT nextval(...) 的列；裸序列名按当前 schema 解析。
+func buildSetvalStmts(tm *meta.TableMeta, dbDir string) []string {
+	if tm.Reloid == 0 {
+		return nil
+	}
+	defaults := catalog.LoadAttrDefaults(dbDir, tm.Reloid, 0)
+	if len(defaults) == 0 {
+		return nil
+	}
+	nameByNum := map[int]string{}
+	for _, c := range tm.Columns {
+		if !c.Attdropped {
+			nameByNum[c.Attnum] = c.Name
+		}
+	}
+	seqRe := regexp.MustCompile(`nextval\('([^']+)'::regclass\)`)
+	var out []string
+	attNums := make([]int, 0, len(defaults))
+	for n := range defaults {
+		attNums = append(attNums, n)
+	}
+	sort.Ints(attNums)
+	for _, n := range attNums {
+		m := seqRe.FindStringSubmatch(defaults[n])
+		if len(m) != 2 {
+			continue
+		}
+		col, ok := nameByNum[n]
+		if !ok {
+			continue
+		}
+		seq := m[1]
+		if !strings.Contains(seq, ".") {
+			seq = tm.Schema + "." + seq
+		}
+		// 空表：setval(seq,1,false) → 下一个 id=1（与 serial 从 1 起始一致）；
+		// 非空表：setval(MAX,true) → 下一个 id=MAX+1
+		out = append(out, fmt.Sprintf("SELECT setval('%s', COALESCE((SELECT MAX(\"%s\") FROM \"%s\".\"%s\"), 1), (SELECT MAX(\"%s\") FROM \"%s\".\"%s\") IS NOT NULL);",
+			seq, col, tm.Schema, tm.Relname, col, tm.Schema, tm.Relname))
+	}
+	return out
 }
 
 // vlog：--verbose 时向 stderr 打印导出信息（不污染输出文件/管道）
@@ -326,22 +517,31 @@ func printHelp() {
                            不指定时按位置参数文件的 relfilenode 自动匹配)
 
 输出模式:
-  --ddl                    输出 CREATE TABLE DDL (含列默认值/主键/唯一/CHECK约束/表列注释)
-  --sql                    输出 INSERT 语句
-  --data                   输出 CSV 格式 (可用 COPY 导入)
+  --ddl                    输出 CREATE TABLE DDL (含列默认值/主键/唯一/CHECK约束/表列注释/
+                           CREATE SEQUENCE/setval/非主键索引)
+  --sql                    输出 INSERT 语句 (数据后追加 setval 序列同步)
+  --data                   输出 CSV 格式 (可用 COPY 导入; --delimiter 指定分隔符)
   --deleted                输出已删除和未删除的行 (t_xmax 已设置但未被 vacuum 清理)
   --only-deleted           只输出已删除的行
   --count                  仅统计行数, 不输出数据
   --list-db                列出数据目录中的所有数据库 (OID + 名称 + 目录路径)
-  --list-tables-db         列出指定数据库目录中的所有表
+  --list-tables-db         列出指定数据库目录中的用户对象 (普通表/索引/序列/TOAST/视图)
+  --list-tables-all        列出指定数据库目录中的全部对象 (含系统 schema)
   --export-meta            导出元数据 JSON
+
+批量导出 (对齐 pg2sql, 位置参数为数据库目录, 必须 -o 目录 + --sql/--data/--ddl 之一):
+  --tables                 批量导出全部用户普通表
+  --all-tables             批量导出全部普通表 (含系统 schema)
+  --schema NAME            按 schema 过滤批量导出 (逗号分隔多值, 等价 --tables --schema)
 
 输出选项:
   -o, --output PATH        输出到文件或目录
-                           未指定时输出到标准输出
-                           目录(以/结尾或已存在)则生成 <路径>/<schema>.<对象名>.<sql|csv>
+                           未指定时输出到标准输出 (批量导出模式必须指定目录)
+                           目录(以/结尾或已存在)则生成 <路径>/<schema>.<对象名>.<sql|csv|ddl>
                            不带扩展名的路径自动追加 .sql/.csv
   --parallel N             并行线程数 (默认 1, 输出与串行逐字节一致)
+  --limit N                只导出前 N 行
+  --delimiter STR          CSV 字段分隔符 (默认 ",")
   --fields COL1,COL2       只导出指定字段 (逗号分隔)
   --header                 CSV 首行输出字段名 (配合 --data, 与 COPY HEADER true 兼容)
   --encoding ENC           库数据解码编码 (自动探测; 探测失败时可指定
@@ -351,6 +551,9 @@ func printHelp() {
 示例:
   gauss2sql-go base/16388/16414 --ddl --sql
   gauss2sql-go base/16388/16414 --data --header -o /tmp/
+  gauss2sql-go base/16388 --tables --schema app --sql -o /tmp/out
+  gauss2sql-go base/16388 --all-tables --ddl -o /tmp/ddl
+  gauss2sql-go base/16388 --list-tables-db
   gauss2sql-go --datadir /data/openGauss --list-db
 `, version)
 }
@@ -386,6 +589,14 @@ var typeNamesFallback = map[int]string{
 	1043: "character varying", 1082: "date", 1083: "time", 1114: "timestamp",
 	1184: "timestamptz", 1186: "interval", 1560: "bit", 1562: "varbit",
 	1700: "numeric", 2950: "uuid", 3802: "jsonb",
+	600: "point", 601: "lseg", 602: "path", 603: "box", 604: "polygon",
+	628: "line", 718: "circle", 774: "macaddr8", 142: "xml",
+	24: "regproc", 2202: "regprocedure", 2203: "regoper", 2204: "regoperator",
+	2205: "regclass", 2206: "regtype", 3734: "regconfig", 3769: "regdictionary",
+	4089: "regnamespace", 4096: "regrole", 4191: "regcollation",
+	3220: "pg_lsn", 3614: "tsvector", 3615: "tsquery",
+	3904: "int4range", 3906: "numrange", 3908: "tsrange", 3910: "tstzrange",
+	3912: "daterange", 3926: "int8range", 5030: "txid_snapshot",
 }
 
 func colTypeSQL(tm *meta.TableMeta, c *meta.Column) string {
@@ -452,6 +663,38 @@ func buildDDL(tm *meta.TableMeta, dbDir string) string {
 		constraints = catalog.LoadConstraints(dbDir, tm.Reloid, 0)
 		comments = catalog.LoadDescriptions(dbDir, tm.Reloid, 0)
 	}
+	// 序列前置：DEFAULT nextval(...) 引用的序列必须先于 CREATE TABLE 创建
+	if len(defaults) > 0 {
+		seqs := catalog.LoadSequences(dbDir, 0)
+		seqRe := regexp.MustCompile(`nextval\('([^']+)'::regclass\)`)
+		seenSeq := map[string]bool{}
+		attNums := make([]int, 0, len(defaults))
+		for n := range defaults {
+			attNums = append(attNums, n)
+		}
+		sort.Ints(attNums)
+		for _, n := range attNums {
+			m := seqRe.FindStringSubmatch(defaults[n])
+			if len(m) != 2 {
+				continue
+			}
+			seq := m[1]
+			if !strings.Contains(seq, ".") {
+				seq = tm.Schema + "." + seq
+			}
+			if seenSeq[seq] {
+				continue
+			}
+			seenSeq[seq] = true
+			// 裸名 → 当前 schema；带 schema 名直接使用
+			schema, name := tm.Schema, seq
+			if i := strings.IndexByte(seq, '.'); i >= 0 {
+				schema, name = seq[:i], seq[i+1:]
+			}
+			_ = seqs // 目录内序列名映射已由 pg_class 校验，此处直接输出
+			sb.WriteString("CREATE SEQUENCE IF NOT EXISTS \"" + schema + "\".\"" + name + "\";\n")
+		}
+	}
 
 	nameByNum := map[int]string{}
 	var colDefs []string
@@ -500,6 +743,30 @@ func buildDDL(tm *meta.TableMeta, dbDir string) string {
 		sb.WriteString(strings.Join(tableCons, ",\n"))
 	}
 	sb.WriteString("\n);")
+	// 非主键索引（含唯一索引；表达式/部分索引跳过；openGauss 默认 USING btree）
+	if tm.Reloid != 0 {
+		for _, ix := range catalog.LoadIndexes(dbDir, tm.Reloid, 0) {
+			var cols []string
+			exprIndex := false
+			for _, n := range ix.Keys {
+				if n <= 0 {
+					exprIndex = true
+					break
+				}
+				if nm, ok := nameByNum[n]; ok {
+					cols = append(cols, "\""+nm+"\"")
+				}
+			}
+			if exprIndex || len(cols) == 0 {
+				continue
+			}
+			uniq := ""
+			if ix.Unique {
+				uniq = "UNIQUE "
+			}
+			sb.WriteString("\nCREATE " + uniq + "INDEX \"" + ix.Name + "\" ON \"" + tm.Schema + "\".\"" + tm.Relname + "\" (" + strings.Join(cols, ", ") + ");")
+		}
+	}
 	// 注释
 	for _, c := range tm.Columns {
 		if c.Attdropped {
@@ -562,7 +829,10 @@ func loadCatalogJSON(path, tableName, targetFile string) *meta.TableMeta {
 	}
 	tables, _ := m["tables"].([]interface{})
 	for _, ti := range tables {
-		t := ti.(map[string]interface{})
+		t, ok := ti.(map[string]interface{})
+		if !ok {
+			continue // meta.json 结构不符条目：跳过而非 panic
+		}
 		name, _ := t["table"].(string)
 		if tableName != "" {
 			if name != tableName {
@@ -597,7 +867,10 @@ func loadCatalogJSON(path, tableName, targetFile string) *meta.TableMeta {
 		var cols []*meta.Column
 		rawCols, _ := t["columns"].([]interface{})
 		for _, ci := range rawCols {
-			cc := ci.(map[string]interface{})
+			cc, ok := ci.(map[string]interface{})
+			if !ok {
+				continue
+			}
 			cols = append(cols, &meta.Column{
 				Name:      getStr(cc, "name"),
 				Atttypid:  int(getF(cc, "type_oid")),
@@ -714,11 +987,10 @@ func listDBs(o *options) {
 	}
 }
 
-func listTablesDB(dbDir string) {
+func listTablesDB(dbDir string, all bool) {
 	abs, _ := filepath.Abs(dbDir)
 	dbOid := filepath.Base(abs)
 	// 扫描目录下数字文件
-	type tableFile struct{ rfn int; path string }
 	var files []int
 	entries, err := os.ReadDir(abs)
 	if err != nil {
@@ -735,34 +1007,33 @@ func listTablesDB(dbDir string) {
 		}
 	}
 	sort.Ints(files)
-	// pg_class 映射
-	rfnToInfo := map[int][2]string{}
-	classPath := catalog.SysFilePathPublic(abs, 1259)
-	if classPath != "" {
-		catalog.IterateClass(abs, 0, func(oid int, relname, relkind string, rfn int) {
-			rfnToInfo[rfn] = [2]string{relname, relkind}
-		})
+	// relfilenode → 表元信息（含 schema/relkind）
+	byRFN := map[int]*meta.TableMeta{}
+	for _, tm := range catalog.AutoDiscoverAllTablesOrdered(abs, 0) {
+		byRFN[tm.Relfilenode] = tm
 	}
 	relkindNames := map[string]string{
 		"r": "普通表", "v": "视图", "m": "物化视图", "i": "索引",
-		"S": "序列", "c": "复合类型", "t": "TOAST表",
+		"S": "序列", "c": "复合类型", "t": "TOAST表", "p": "分区表",
 	}
 	fmt.Printf("数据库 OID: %s\n", dbOid)
-	fmt.Printf("%-14s %-30s %-10s %s\n", "relfilenode", "表名", "类型", "文件路径")
+	fmt.Printf("%-14s %-40s %-10s %s\n", "relfilenode", "表名", "类型", "文件路径")
 	fmt.Println("------------------------------------------------------------------------------------------")
 	for _, rfn := range files {
 		path := filepath.Join(abs, strconv.Itoa(rfn))
-		info, ok := rfnToInfo[rfn]
-		if ok {
-			relname, relkind := info[0], info[1]
-			kindStr := relkindNames[relkind]
-			if kindStr == "" {
-				kindStr = relkind
-			}
-			fmt.Printf("%-14d %-30s %-10s %s\n", rfn, relname, kindStr, path)
-		} else {
-			fmt.Printf("%-14d %-30s %-10s %s\n", rfn, "(未知/系统表)", "-", path)
+		tm, ok := byRFN[rfn]
+		if !ok {
+			fmt.Printf("%-14d %-40s %-10s %s\n", rfn, "(未知/系统表)", "-", path)
+			continue
 		}
+		if !all && isSystemSchema(tm.Schema) {
+			continue // --list-tables-db 默认只列用户对象（对齐 pg2sql）
+		}
+		kindStr := relkindNames[tm.Relkind]
+		if kindStr == "" {
+			kindStr = tm.Relkind
+		}
+		fmt.Printf("%-14d %-40s %-10s %s\n", rfn, tm.Schema+"."+tm.Relname, kindStr, path)
 	}
 }
 

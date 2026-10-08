@@ -108,9 +108,15 @@ func ExtractFieldsDirect(raw []byte, tHoff int, nulls []bool, colLengths []ColLa
 			kind, total, _, _ := binary.VarlenaParse(raw, offset)
 			switch kind {
 			case binary.VARLENAExternal:
+				if offset+18 > nraw {
+					return fields // varlena 越界（损坏数据）：截断返回，同 CalculateTupleSize 语义
+				}
 				fields = append(fields, append([]byte(nil), raw[offset:offset+18]...))
 				pos += 18
 			case binary.VARLENA1B, binary.VARLENA4B, binary.VARLENA4BComp:
+				if offset+total > nraw {
+					return fields
+				}
 				fields = append(fields, append([]byte(nil), raw[offset:offset+total]...))
 				pos += total
 			default:
@@ -305,6 +311,7 @@ func (h *HeapFile) iterPagesRange(data []byte, ps, start, end int, cb func(pagen
 		raw := data[pno*ps : (pno+1)*ps]
 		pg := page.NewPage(pno, raw, ps)
 		if !pg.HasValidLayout {
+			h.badPages = append(h.badPages, pno) // 损坏页：记录供 Phase2 数据区扫描补漏
 			continue
 		}
 		if !cb(pno, pg) {
@@ -448,6 +455,25 @@ func (h *HeapFile) dumpRowsSerial(tm *meta.TableMeta, includeDeleted, onlyDelete
 		return true
 	})
 	if foundStandard && hasValid {
+		if len(h.badPages) > 0 {
+			// 存在损坏页：对坏页做数据区扫描补漏（坏页在 Phase1 无行，追加不重复）
+			ps := h.detectSize()
+			if data, err := os.ReadFile(h.Path); err == nil {
+				for _, pno := range h.badPages {
+					h.scanTuplesRange(data, ps, pno, pno+1, nExpected, colLengths, func(pageno, pos int, t *tuple.HeapTuple) bool {
+						r := h.buildRow(t, pageno, pos, tm, colLengths, includeDeleted, onlyDeleted)
+						if r == nil {
+							return true
+						}
+						standard = append(standard, *r)
+						return limit <= 0 || len(standard) < limit
+					})
+					if limit > 0 && len(standard) >= limit {
+						break
+					}
+				}
+			}
+		}
 		return standard
 	}
 	// Phase 2
@@ -534,6 +560,7 @@ func (h *HeapFile) DumpRowsParallel(tm *meta.TableMeta, includeDeleted, onlyDele
 	type segResult struct {
 		rows     []Row
 		hasValid bool
+		badPages []int
 	}
 	var wg sync.WaitGroup
 
@@ -545,18 +572,37 @@ func (h *HeapFile) DumpRowsParallel(tm *meta.TableMeta, includeDeleted, onlyDele
 			defer wg.Done()
 			var rows []Row
 			hasValid := false
-			h.iterTuplesRange(data, ps, s[0], s[1], true, func(pageno, idx int, t *tuple.HeapTuple) bool {
-				r := h.buildRow(t, pageno, idx, tm, colLengths, includeDeleted, onlyDeleted)
-				if r == nil {
-					return true
+			// 段内内联遍历（避免共享 h.badPages 的并发写竞争）：坏页段内收集
+			var bad []int
+			for pno := s[0]; pno < s[1]; pno++ {
+				raw := data[pno*ps : (pno+1)*ps]
+				pg := page.NewPage(pno, raw, ps)
+				if !pg.HasValidLayout {
+					bad = append(bad, pno)
+					continue
 				}
-				rows = append(rows, *r)
-				if rowHasValid(r) {
-					hasValid = true
+				for _, it := range pg.Items {
+					if it.Flags != page.ItemIDNormal {
+						continue
+					}
+					t, err := tuple.New(pg.Raw[it.Off : it.Off+it.Len])
+					if err != nil {
+						continue
+					}
+					if !includeDeleted && !t.IsLive() {
+						continue
+					}
+					r := h.buildRow(t, pno, it.Index, tm, colLengths, includeDeleted, onlyDeleted)
+					if r == nil {
+						continue
+					}
+					rows = append(rows, *r)
+					if rowHasValid(r) {
+						hasValid = true
+					}
 				}
-				return true
-			})
-			results[i] = segResult{rows: rows, hasValid: hasValid}
+			}
+			results[i] = segResult{rows: rows, hasValid: hasValid, badPages: bad}
 		}(i, s)
 	}
 	wg.Wait()
@@ -572,6 +618,16 @@ func (h *HeapFile) DumpRowsParallel(tm *meta.TableMeta, includeDeleted, onlyDele
 		var out []Row
 		for i := range results {
 			out = append(out, results[i].rows...)
+			for _, pno := range results[i].badPages {
+				h.scanTuplesRange(data, ps, pno, pno+1, nExpected, colLengths, func(pageno, pos int, t *tuple.HeapTuple) bool {
+					r := h.buildRow(t, pageno, pos, tm, colLengths, includeDeleted, onlyDeleted)
+					if r == nil {
+						return true
+					}
+					out = append(out, *r)
+					return true
+				})
+			}
 		}
 		return out
 	}
