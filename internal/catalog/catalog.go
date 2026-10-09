@@ -4,6 +4,7 @@ package catalog
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -929,6 +930,145 @@ func IterateClass(dbDir string, pageSize int, cb func(oid int, relname, relkind 
 		}
 		return true
 	})
+}
+
+// 注：pg_partition 定位不依赖固定 OID（openGauss 中其 OID 非 8190 且不在 relmapper），
+// 由 partitionFilePath 从 pg_class 按 relname 实时取 relfilenode。
+
+// FindTableMetaByName 按表名（"schema.table" 或裸表名）从数据库目录定位表元数据（v0.2.12）。
+// 返回 (表元数据, 物理文件路径)；分区父表（relfilenode==0）时物理文件路径为空串，
+// 调用方须用 ListPartitionFiles 展开子分区文件。
+// 裸表名在多 schema 下同名时报错，提示用 schema.table 指定。
+func FindTableMetaByName(dbDir, name string) (*meta.TableMeta, string, error) {
+	abs, _ := filepath.Abs(dbDir)
+	nsMap := loadNSMap(abs)
+	pgAttrPath := SysFilePath(abs, pgAttrOID)
+	var attByRel map[int][]*meta.Column
+	if pgAttrPath != "" {
+		attByRel = loadAttrs(abs, pgAttrPath)
+	}
+	var schema, relname string
+	if i := strings.Index(name, "."); i >= 0 {
+		schema, relname = name[:i], name[i+1:]
+	} else {
+		relname = name
+	}
+	var matches []*classRow
+	pgClassPath := SysFilePath(abs, pgClassOID)
+	if pgClassPath != "" {
+		iterateTuples(pgClassPath, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
+			if row := classFields(t); row != nil && row.relname == relname {
+				if schema == "" || nsMap[row.relns] == schema {
+					matches = append(matches, row)
+				}
+			}
+			return true
+		})
+	}
+	if len(matches) == 0 {
+		return nil, "", fmt.Errorf("未找到表 %q（检查 schema.table 或数据库目录是否正确）", name)
+	}
+	if schema == "" && len(matches) > 1 {
+		var names []string
+		for _, m := range matches {
+			ns := nsMap[m.relns]
+			if ns == "" {
+				ns = "public"
+			}
+			names = append(names, ns+"."+m.relname)
+		}
+		return nil, "", fmt.Errorf("表 %q 在多个 schema 下存在: %s，请用 schema.table 指定", name, strings.Join(names, ", "))
+	}
+	row := matches[0]
+	ns := nsMap[row.relns]
+	if ns == "" {
+		ns = "public"
+	}
+	cols := attByRel[row.oid]
+	if len(cols) == 0 {
+		return nil, "", fmt.Errorf("表 %s.%s 无列定义（pg_attribute 解析失败）", ns, row.relname)
+	}
+	tm := &meta.TableMeta{
+		DBName:      filepath.Base(abs),
+		Schema:      ns,
+		Relname:     row.relname,
+		Relfilenode: row.relfilenode,
+		Reloid:      row.oid,
+		Columns:     cols,
+		Relkind:     row.relkind,
+		Toastrelid:  row.toastrelid,
+		TypeNames:   BuildTypeNameMap(abs),
+	}
+	filePath := ""
+	if row.relfilenode != 0 {
+		filePath = FindPhysicalFileByOid(abs, row.oid)
+		if filePath == "" {
+			filePath = filepath.Join(abs, strconv.Itoa(row.relfilenode))
+		}
+		if _, err := os.Stat(filePath); err != nil {
+			filePath = "" // 物理文件不存在：分区父表（relfilenode 兜底为 oid 但无独立文件）
+		}
+	}
+	if filePath == "" {
+		// 分区父表判定：pg_partition 中存在 parentid=本表 oid 的子分区
+		if parts := ListPartitionFiles(abs, row.oid); len(parts) > 0 {
+			tm.Relfilenode = 0 // 父表无独立物理文件，由调用方展开子分区
+		}
+	}
+	return tm, filePath, nil
+}
+
+// ListPartitionFiles 列出分区父表（parentOid）的全部子分区物理数据文件（v0.2.12）。
+// openGauss 分区父表 relfilenode=0，子分区元数据在 pg_partition（parentid→父表 OID）。
+func ListPartitionFiles(dbDir string, parentOid int) []string {
+	abs, _ := filepath.Abs(dbDir)
+	partPath := partitionFilePath(abs)
+	var files []string
+	if partPath == "" {
+		return files
+	}
+	iterateTuples(partPath, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
+		relname, _, parentid, rfn := partitionFields(t)
+		if relname == "" || parentid != parentOid || rfn == 0 {
+			return true
+		}
+		p := FindPhysicalFileByOid(abs, rfn)
+		if p == "" {
+			p = filepath.Join(abs, strconv.Itoa(rfn))
+		}
+		if _, err := os.Stat(p); err == nil {
+			files = append(files, p)
+		}
+		return true
+	})
+	return files
+}
+
+// partitionFilePath 定位 pg_partition 物理文件。
+// 不依赖固定 OID/relmapper（openGauss pg_partition OID 非 8190 且不在 relmapper），
+// 从 pg_class 取 relname='pg_partition' 的实时 relfilenode（与 tryPartitionFallback 同法）。
+func partitionFilePath(dbDir string) string {
+	pgClassPath := SysFilePath(dbDir, pgClassOID)
+	if pgClassPath == "" {
+		return ""
+	}
+	rf := 0
+	iterateTuples(pgClassPath, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
+		row := classFields(t)
+		if row != nil && row.relname == "pg_partition" && row.relfilenode != 0 {
+			rf = row.relfilenode
+			return false
+		}
+		return true
+	})
+	if rf == 0 {
+		return ""
+	}
+	p := filepath.Join(dbDir, strconv.Itoa(rf))
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
 }
 
 // LoadDBNames 解析 <pgdata>/global/pg_database (OID 1262) → {oid: datname}

@@ -2,7 +2,7 @@
 
 > 作者：raysuen
 
-> 当前版本：**v0.2.11**（变更记录见[第五节](#五变更记录)）
+> 当前版本：**v0.2.12**（变更记录见[第五节](#五变更记录)）
 
 > 离线解析 openGauss（含 openGauss 衍生库）数据目录堆文件并导出为 SQL / CSV / DDL / 元数据 JSON 的 Go 实现。
 
@@ -29,6 +29,7 @@ gauss2sql-go 是 gauss2sql（Python 版）的 **Golang 完整重写版**，功�
 - `--count`：仅统计行数
 - `--fields / --header / --encoding`：字段过滤 / 表头 / 字符集解码编码（UTF8/GBK/GB18030/LATIN1 等）
 - `--catalog-json --table-name`：配合元数据 JSON 按表名导出（含分区子分区表）
+- `--table-name` 表名直查导出（v0.2.12 起）：位置参数为**数据库目录**时，直查系统目录（pg_class/pg_namespace/pg_attribute）按名定位表并导出，无需 --catalog-json——支持 `schema.table` 与裸表名（后者要求全库唯一，多 schema 同名报错）、分区父表自动展开全部子分区（子分区逐字节等于各分区文件拼接）
 
 ### 坏块（损坏页/损坏数据）健壮性支持（v0.2.8 起）
 
@@ -168,6 +169,7 @@ gauss2sql-go base/16388/16414 --catalog-json meta.json --table-name app.t_del --
 
 ## 五、变更记录
 
+- **v0.2.12（2026-10-09）**：新增 `--table-name` 表名直查导出——位置参数为数据库目录时按名定位表（系统目录直查，无需 --catalog-json）：支持 `schema.table`/裸表名（全库唯一校验、多 schema 同名报错）、分区父表自动展开全部子分区导出；新增 `catalog.FindTableMetaByName`/`ListPartitionFiles`（pg_partition 从 pg_class 按 relname 实时定位，不依赖固定 OID）；抽离 `emitOutput` 复用单文件输出逻辑。本地验证：50 字段表 50052 行 SQL/CSV/parallel 逐字节一致、分区父表展开==子分区拼接、错误表名 exit 1。
 - **v0.2.11（2026-10-08）**：文档轮——README 坏块说明从功能特性列表抽离为**独立小节**，并以**三级处理表格**（页头损坏→数据区扫描补漏 / 单个坏行→丢弃 / 字段级损坏→安全降级 + 检测方式/动作/效果）呈现。无逻辑与代码变更，仅文档。
 - **v0.2.10（2026-10-08）**：文档轮——README 坏块说明扩写为**三级处理结构**（页头损坏→数据区扫描补漏 / 单个坏行→丢弃 / 字段级损坏→安全降级），与实测行为逐条对应。无逻辑与代码变更，仅文档。
 - **v0.2.9（2026-10-08）**：文档轮——README 功能特性补充**坏块（损坏页/损坏数据）健壮性支持**说明（v0.2.8 的 C2 坏页补漏 / B3-B6 越界保护 / B1-B2 安全退出行为成文描述）。无逻辑与代码变更，仅文档。

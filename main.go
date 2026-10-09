@@ -21,7 +21,7 @@ import (
 	"gauss2sql-go/internal/types"
 )
 
-var version = "0.2.11"
+var version = "0.2.12"
 
 type options struct {
 	dataPath      string
@@ -172,6 +172,14 @@ func main() {
 		exportMeta(abs, o)
 		return
 	}
+	// --table-name（无 --catalog-json）+ 数据库目录：按表名直查导出（v0.2.12）
+	if o.tableName != "" && o.catalogJSON == "" {
+		if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
+			exportOneTableByName(abs, o)
+			return
+		}
+		// 位置参数为单个数据文件时忽略 --table-name（走自动发现，保持原行为）
+	}
 	if o.tables || o.allTables || o.schema != "" {
 		exportDBAll(abs, o)
 		return
@@ -189,6 +197,11 @@ func main() {
 	}
 	catalog.LoadEnumMap(dbDir)
 	out, nRows, tm := dumpOneTable(abs, o)
+	emitOutput(out, nRows, tm, o)
+}
+
+// emitOutput 输出导出结果：count 打印到 stdout；否则按 resolveOutput 规则写文件或 stdout（v0.2.12 抽取自单文件模式）
+func emitOutput(out string, nRows int, tm *meta.TableMeta, o *options) {
 	if o.count {
 		fmt.Print(out)
 		return
@@ -216,6 +229,142 @@ func main() {
 		}
 		vlog(o, "完成: %d 行, 耗时 %.2fs", nRows, time.Since(start).Seconds())
 	}
+}
+
+// exportOneTableByName 位置参数为数据库目录 + --table-name（无 --catalog-json）时按表名直查导出（v0.2.12）。
+// 支持 "schema.table" 与裸表名（后者要求全库唯一）；分区父表展开全部子分区文件导出。
+func exportOneTableByName(dbDir string, o *options) {
+	dbOid, _ := strconv.Atoi(filepath.Base(dbDir))
+	if enc := catalog.DetectDatabaseEncoding(filepath.Dir(filepath.Dir(dbDir)), dbOid); enc != "" {
+		binary.SetTextEncoding(enc)
+	}
+	if o.encoding != "" {
+		binary.SetTextEncoding(o.encoding)
+	}
+	catalog.LoadEnumMap(dbDir)
+
+	tm, filePath, err := catalog.FindTableMetaByName(dbDir, o.tableName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	vlog(o, "按表名定位: %s.%s (relfilenode=%d, relkind=%s)", tm.Schema, tm.Relname, tm.Relfilenode, tm.Relkind)
+
+	if tm.Relfilenode == 0 {
+		// 分区父表：DDL 一次 + 全部子分区数据
+		exportPartitionParent(dbDir, tm, o)
+		return
+	}
+	if filePath == "" {
+		fmt.Fprintf(os.Stderr, "error: 表 %s 无物理数据文件\n", o.tableName)
+		os.Exit(1)
+	}
+	out, nRows, tm2 := dumpOneTable(filePath, o)
+	emitOutput(out, nRows, tm2, o)
+}
+
+// exportPartitionParent 分区父表导出：DDL 使用父表列定义输出一次，数据按全部子分区文件
+// 逐个解析并拼接（行顺序 = pg_partition 扫描顺序），最后统一追加 setval 同步。
+func exportPartitionParent(dbDir string, tm *meta.TableMeta, o *options) {
+	files := catalog.ListPartitionFiles(dbDir, tm.Reloid)
+	if len(files) == 0 {
+		fmt.Fprintf(os.Stderr, "error: 分区父表 %s 无子分区数据文件\n", o.tableName)
+		os.Exit(1)
+	}
+	vlog(o, "分区父表: 展开 %d 个子分区文件", len(files))
+
+	fields := parseFields(o.fields)
+	if len(fields) > 0 {
+		valid := map[string]bool{}
+		for _, c := range tm.Columns {
+			if !c.Attdropped {
+				valid[c.Name] = true
+			}
+		}
+		var missing []string
+		for f := range fields {
+			if !valid[f] {
+				missing = append(missing, f)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			fmt.Fprintln(os.Stderr, "--fields 中不存在的字段:", strings.Join(missing, ","))
+			os.Exit(1)
+		}
+	}
+
+	if o.count {
+		total := 0
+		for _, f := range files {
+			sub := catalog.AutoDiscoverMeta(f, 0)
+			if sub == nil {
+				continue
+			}
+			hf := heapfile.NewHeapFile(f, 0)
+			if o.parallel > 1 {
+				hf.Parallel = o.parallel
+			}
+			total += len(hf.DumpRows(sub, o.deleted, o.onlyDeleted, o.limit))
+		}
+		fmt.Printf("-- 总行数: %d\n", total)
+		return
+	}
+
+	var out strings.Builder
+	var nRows int
+	if o.ddl {
+		out.WriteString(buildDDL(tm, dbDir))
+		out.WriteString("\n\n")
+	}
+	for _, f := range files {
+		sub := catalog.AutoDiscoverMeta(f, 0)
+		if sub == nil {
+			fmt.Fprintf(os.Stderr, "warning: 子分区文件无法解析结构, 跳过: %s\n", f)
+			continue
+		}
+		if sub.Toastrelid == 0 {
+			sub.Toastrelid = tm.Toastrelid // 分区表 TOAST 在父表上，子分区继承
+		}
+		hf := heapfile.NewHeapFile(f, 0)
+		if o.parallel > 1 {
+			hf.Parallel = o.parallel
+		}
+		if sub.Toastrelid != 0 {
+			tp := catalog.FindPhysicalFileByOid(dbDir, sub.Toastrelid)
+			if tp == "" {
+				tp = filepath.Join(dbDir, strconv.Itoa(sub.Toastrelid))
+			}
+			if _, err := os.Stat(tp); err == nil {
+				tt := toast.New(tp, 0)
+				tt.BuildIndex()
+				hf.Toast = tt
+			}
+		}
+		if o.sql {
+			lines := hf.ToSQL(sub, o.deleted, o.onlyDeleted, o.limit, true, false, fields)
+			for _, s := range lines {
+				out.WriteString(s)
+				out.WriteString("\n")
+			}
+			nRows += len(lines)
+		}
+		if o.data {
+			lines := hf.ToData(sub, o.deleted, o.onlyDeleted, o.limit, o.delimiter, fields, o.header)
+			for _, line := range lines {
+				out.WriteString(line)
+				out.WriteString("\n")
+			}
+			nRows += len(lines)
+		}
+	}
+	if o.sql {
+		for _, s := range buildSetvalStmts(tm, dbDir) {
+			out.WriteString(s)
+			out.WriteString("\n")
+		}
+	}
+	emitOutput(out.String(), nRows, tm, o)
 }
 
 // dumpOneTable 导出单表内容（DDL/SQL/CSV/count），返回输出内容与行数。
@@ -513,8 +662,10 @@ func printHelp() {
 
 元数据 (可选, 不指定则自动发现):
   --catalog-json FILE      从 JSON 文件加载元数据 (由 --export-meta 导出)
-  --table-name NAME        指定表名 (schema.table 或 table, 配合 --catalog-json;
-                           不指定时按位置参数文件的 relfilenode 自动匹配)
+  --table-name NAME        指定表名 (schema.table 或 table)
+                           配合 --catalog-json: 从 JSON 按名匹配表
+                           位置参数为数据库目录时: 按名直查系统目录定位表并导出
+                           (支持分区父表, 自动展开全部子分区; 裸表名需全库唯一)
 
 输出模式:
   --ddl                    输出 CREATE TABLE DDL (含列默认值/主键/唯一/CHECK约束/表列注释/
@@ -551,6 +702,8 @@ func printHelp() {
 示例:
   gauss2sql-go base/16388/16414 --ddl --sql
   gauss2sql-go base/16388/16414 --data --header -o /tmp/
+  gauss2sql-go base/16388 --table-name ray.test_50col --sql --ddl -o /tmp/gauss2sql
+  gauss2sql-go base/16388 --table-name test_50col --data --header -o /tmp/gauss2sql
   gauss2sql-go base/16388 --tables --schema app --sql -o /tmp/out
   gauss2sql-go base/16388 --all-tables --ddl -o /tmp/ddl
   gauss2sql-go base/16388 --list-tables-db
