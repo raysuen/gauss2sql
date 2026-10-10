@@ -3,8 +3,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,7 +23,7 @@ import (
 	"gauss2sql-go/internal/types"
 )
 
-var version = "0.2.12"
+var version = "0.2.15"
 
 type options struct {
 	dataPath      string
@@ -196,39 +198,62 @@ func main() {
 		binary.SetTextEncoding(o.encoding)
 	}
 	catalog.LoadEnumMap(dbDir)
-	out, nRows, tm := dumpOneTable(abs, o)
-	emitOutput(out, nRows, tm, o)
-}
-
-// emitOutput 输出导出结果：count 打印到 stdout；否则按 resolveOutput 规则写文件或 stdout（v0.2.12 抽取自单文件模式）
-func emitOutput(out string, nRows int, tm *meta.TableMeta, o *options) {
+	tm := resolveTableMeta(abs, o)
 	if o.count {
-		fmt.Print(out)
+		n := countTable(abs, o, tm)
+		fmt.Printf("-- 总行数: %d\n", n)
+		if o.verbose {
+			vlog(o, "统计完成: %d 行", n)
+		}
 		return
 	}
 	ext := "sql"
 	if o.data {
 		ext = "csv"
 	}
-	outPath := resolveOutput(o.output, tm, ext)
 	start := time.Now()
-	writeOutput(outPath, out)
-	if o.verbose {
-		mode := "sql"
-		if o.data {
-			mode = "csv"
-		}
-		if o.ddl && !o.data {
-			mode = "ddl+sql"
-		}
-		vlog(o, "模式: %s (parallel=%d, encoding=%s)", mode, o.parallel, binary.GetTextEncoding())
-		if outPath == "" {
-			vlog(o, "输出到: 标准输出")
-		} else {
-			vlog(o, "输出到: %s", outPath)
-		}
-		vlog(o, "完成: %d 行, 耗时 %.2fs", nRows, time.Since(start).Seconds())
+	w, done, outPath := openOutWriter(o, tm, ext)
+	nRows, _ := streamTable(abs, o, w)
+	done()
+	verboseReport(o, tm, outPath, nRows, ext, start)
+}
+
+// openOutWriter 打开输出 writer：-o 未指定 → stdout（不关闭）；否则按 resolveOutput 规则创建文件。
+// 返回 writer、完成回调（flush+close）、输出路径（""=标准输出）。
+func openOutWriter(o *options, tm *meta.TableMeta, ext string) (*bufio.Writer, func(), string) {
+	if o.output == "" {
+		w := bufio.NewWriterSize(os.Stdout, 1<<20)
+		return w, func() { _ = w.Flush() }, ""
 	}
+	path := resolveOutput(o.output, tm, ext)
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	w := bufio.NewWriterSize(f, 1<<20)
+	return w, func() { _ = w.Flush(); _ = f.Close() }, path
+}
+
+// verboseReport 输出 --verbose 报告（模式/输出目标/行数/耗时）
+func verboseReport(o *options, tm *meta.TableMeta, outPath string, nRows int, ext string, start time.Time) {
+	if !o.verbose {
+		return
+	}
+	mode := "sql"
+	if ext == "csv" {
+		mode = "csv"
+	}
+	if o.ddl && !o.data {
+		mode = "ddl+sql"
+	}
+	vlog(o, "模式: %s (parallel=%d, encoding=%s)", mode, o.parallel, binary.GetTextEncoding())
+	if outPath == "" {
+		vlog(o, "输出到: 标准输出")
+	} else {
+		vlog(o, "输出到: %s", outPath)
+	}
+	vlog(o, "完成: %d 行, 耗时 %.2fs", nRows, time.Since(start).Seconds())
 }
 
 // exportOneTableByName 位置参数为数据库目录 + --table-name（无 --catalog-json）时按表名直查导出（v0.2.12）。
@@ -259,12 +284,27 @@ func exportOneTableByName(dbDir string, o *options) {
 		fmt.Fprintf(os.Stderr, "error: 表 %s 无物理数据文件\n", o.tableName)
 		os.Exit(1)
 	}
-	out, nRows, tm2 := dumpOneTable(filePath, o)
-	emitOutput(out, nRows, tm2, o)
+	if o.count {
+		n := countTable(filePath, o, tm)
+		fmt.Printf("-- 总行数: %d\n", n)
+		if o.verbose {
+			vlog(o, "统计完成: %d 行", n)
+		}
+		return
+	}
+	ext := "sql"
+	if o.data {
+		ext = "csv"
+	}
+	start := time.Now()
+	w, done, outPath := openOutWriter(o, tm, ext)
+	nRows, _ := streamTable(filePath, o, w)
+	done()
+	verboseReport(o, tm, outPath, nRows, ext, start)
 }
 
-// exportPartitionParent 分区父表导出：DDL 使用父表列定义输出一次，数据按全部子分区文件
-// 逐个解析并拼接（行顺序 = pg_partition 扫描顺序），最后统一追加 setval 同步。
+// exportPartitionParent 分区父表导出（v0.2.13 流式）：DDL 使用父表列定义输出一次，
+// 数据按全部子分区文件逐个流式解析并输出（行顺序 = pg_partition 扫描顺序），最后统一追加 setval。
 func exportPartitionParent(dbDir string, tm *meta.TableMeta, o *options) {
 	files := catalog.ListPartitionFiles(dbDir, tm.Reloid)
 	if len(files) == 0 {
@@ -301,21 +341,24 @@ func exportPartitionParent(dbDir string, tm *meta.TableMeta, o *options) {
 			if sub == nil {
 				continue
 			}
-			hf := heapfile.NewHeapFile(f, 0)
-			if o.parallel > 1 {
-				hf.Parallel = o.parallel
-			}
-			total += len(hf.DumpRows(sub, o.deleted, o.onlyDeleted, o.limit))
+			hf := subHeapFile(f, o, dbDir, tm, sub)
+			n, _ := hf.StreamRowsCount(sub, o.deleted, o.onlyDeleted, o.limit)
+			total += n
 		}
 		fmt.Printf("-- 总行数: %d\n", total)
 		return
 	}
 
-	var out strings.Builder
+	ext := "sql"
+	if o.data {
+		ext = "csv"
+	}
+	start := time.Now()
+	w, done, outPath := openOutWriter(o, tm, ext)
+	defer done()
 	var nRows int
 	if o.ddl {
-		out.WriteString(buildDDL(tm, dbDir))
-		out.WriteString("\n\n")
+		fmt.Fprintf(w, "%s\n\n", buildDDL(tm, dbDir))
 	}
 	for _, f := range files {
 		sub := catalog.AutoDiscoverMeta(f, 0)
@@ -326,52 +369,55 @@ func exportPartitionParent(dbDir string, tm *meta.TableMeta, o *options) {
 		if sub.Toastrelid == 0 {
 			sub.Toastrelid = tm.Toastrelid // 分区表 TOAST 在父表上，子分区继承
 		}
-		hf := heapfile.NewHeapFile(f, 0)
-		if o.parallel > 1 {
-			hf.Parallel = o.parallel
-		}
-		if sub.Toastrelid != 0 {
-			tp := catalog.FindPhysicalFileByOid(dbDir, sub.Toastrelid)
-			if tp == "" {
-				tp = filepath.Join(dbDir, strconv.Itoa(sub.Toastrelid))
-			}
-			if _, err := os.Stat(tp); err == nil {
-				tt := toast.New(tp, 0)
-				tt.BuildIndex()
-				hf.Toast = tt
-			}
-		}
+		hf := subHeapFile(f, o, dbDir, tm, sub)
 		if o.sql {
-			lines := hf.ToSQL(sub, o.deleted, o.onlyDeleted, o.limit, true, false, fields)
-			for _, s := range lines {
-				out.WriteString(s)
-				out.WriteString("\n")
+			n, err := hf.StreamSQL(sub, o.deleted, o.onlyDeleted, o.limit, true, false, fields, writeLine(w))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
 			}
-			nRows += len(lines)
+			nRows = n
 		}
 		if o.data {
-			lines := hf.ToData(sub, o.deleted, o.onlyDeleted, o.limit, o.delimiter, fields, o.header)
-			for _, line := range lines {
-				out.WriteString(line)
-				out.WriteString("\n")
+			n, err := hf.StreamToData(sub, o.deleted, o.onlyDeleted, o.limit, o.delimiter, fields, o.header, writeLine(w))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
 			}
-			nRows += len(lines)
+			nRows = n
 		}
 	}
 	if o.sql {
 		for _, s := range buildSetvalStmts(tm, dbDir) {
-			out.WriteString(s)
-			out.WriteString("\n")
+			fmt.Fprintln(w, s)
 		}
 	}
-	emitOutput(out.String(), nRows, tm, o)
+	done()
+	verboseReport(o, tm, outPath, nRows, ext, start)
 }
 
-// dumpOneTable 导出单表内容（DDL/SQL/CSV/count），返回输出内容与行数。
-// 编码探测与枚举加载由调用方在进入前完成（全局幂等）。
-func dumpOneTable(abs string, o *options) (string, int, *meta.TableMeta) {
-	dbDir := filepath.Dir(abs)
+// subHeapFile 创建子分区 HeapFile（TOAST 继承父表后挂载）
+func subHeapFile(f string, o *options, dbDir string, tm *meta.TableMeta, sub *meta.TableMeta) *heapfile.HeapFile {
+	hf := heapfile.NewHeapFile(f, 0)
+	if o.parallel > 1 {
+		hf.Parallel = o.parallel
+	}
+	if sub.Toastrelid != 0 {
+		tp := catalog.FindPhysicalFileByOid(dbDir, sub.Toastrelid)
+		if tp == "" {
+			tp = filepath.Join(dbDir, strconv.Itoa(sub.Toastrelid))
+		}
+		if _, err := os.Stat(tp); err == nil {
+			tt := toast.New(tp, 0)
+			tt.BuildIndex()
+			hf.Toast = tt
+		}
+	}
+	return hf
+}
 
+// resolveTableMeta 解析表元数据（--catalog-json 优先，否则自动发现）；失败时退出。
+func resolveTableMeta(abs string, o *options) *meta.TableMeta {
 	var tm *meta.TableMeta
 	if o.catalogJSON != "" {
 		tm = loadCatalogJSON(o.catalogJSON, o.tableName, filepath.Base(abs))
@@ -389,12 +435,15 @@ func dumpOneTable(abs string, o *options) (string, int, *meta.TableMeta) {
 		fmt.Fprintln(os.Stderr, "error: cannot discover table structure")
 		os.Exit(1)
 	}
+	return tm
+}
 
+// newHeapFile 创建堆文件读取器并挂载 TOAST（light 索引）
+func newHeapFile(abs string, o *options, dbDir string, tm *meta.TableMeta) *heapfile.HeapFile {
 	hf := heapfile.NewHeapFile(abs, 0)
 	if o.parallel > 1 {
 		hf.Parallel = o.parallel
 	}
-	// TOAST：reltoastrelid 是 toast 表 OID，需映射到物理 relfilenode
 	if tm.Toastrelid != 0 {
 		tp := catalog.FindPhysicalFileByOid(dbDir, tm.Toastrelid)
 		if tp == "" {
@@ -407,64 +456,85 @@ func dumpOneTable(abs string, o *options) (string, int, *meta.TableMeta) {
 			vlog(o, "TOAST: %s (light 索引)", tp)
 		}
 	}
+	return hf
+}
 
-	if o.count {
-		rows := hf.DumpRows(tm, o.deleted, o.onlyDeleted, o.limit)
-		if o.verbose {
-			fmt.Fprintf(os.Stderr, "[verbose] 统计完成: %d 行\n", len(rows))
-		}
-		return fmt.Sprintf("-- 总行数: %d\n", len(rows)), len(rows), tm
+// validateFields 校验 --fields 字段存在性；缺失时退出
+func validateFields(tm *meta.TableMeta, fields map[string]bool) {
+	if len(fields) == 0 {
+		return
 	}
+	valid := map[string]bool{}
+	for _, c := range tm.Columns {
+		if !c.Attdropped {
+			valid[c.Name] = true
+		}
+	}
+	var missing []string
+	for f := range fields {
+		if !valid[f] {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		fmt.Fprintln(os.Stderr, "--fields 中不存在的字段:", strings.Join(missing, ","))
+		os.Exit(1)
+	}
+}
 
+// writeLine 行写入回调（适配流式 API）
+func writeLine(w io.Writer) func(string) error {
+	return func(line string) error {
+		_, err := io.WriteString(w, line)
+		return err
+	}
+}
+
+// streamTable 流式导出单表（DDL/SQL/CSV/setval 直接写入 w，v0.2.13 A+B：内存 O(块)）。
+// 返回行数与元数据；行数语义与旧版一致（data 覆盖 sql）。
+func streamTable(abs string, o *options, w io.Writer) (int, *meta.TableMeta) {
+	dbDir := filepath.Dir(abs)
+	tm := resolveTableMeta(abs, o)
+	hf := newHeapFile(abs, o, dbDir, tm)
 	fields := parseFields(o.fields)
-	if len(fields) > 0 {
-		valid := map[string]bool{}
-		for _, c := range tm.Columns {
-			if !c.Attdropped {
-				valid[c.Name] = true
-			}
-		}
-		var missing []string
-		for f := range fields {
-			if !valid[f] {
-				missing = append(missing, f)
-			}
-		}
-		if len(missing) > 0 {
-			sort.Strings(missing)
-			fmt.Fprintln(os.Stderr, "--fields 中不存在的字段:", strings.Join(missing, ","))
-			os.Exit(1)
-		}
-	}
+	validateFields(tm, fields)
 
-	var out strings.Builder
 	var nRows int
 	if o.ddl {
-		out.WriteString(buildDDL(tm, dbDir))
-		out.WriteString("\n\n")
+		fmt.Fprintf(w, "%s\n\n", buildDDL(tm, dbDir))
 	}
 	if o.sql {
-		lines := hf.ToSQL(tm, o.deleted, o.onlyDeleted, o.limit, true, false, fields)
-		for _, s := range lines {
-			out.WriteString(s)
-			out.WriteString("\n")
+		n, err := hf.StreamSQL(tm, o.deleted, o.onlyDeleted, o.limit, true, false, fields, writeLine(w))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
 		}
-		nRows = len(lines)
-		// setval 序列同步（数据导入后执行，自增列不冲突）
+		nRows = n
 		for _, s := range buildSetvalStmts(tm, dbDir) {
-			out.WriteString(s)
-			out.WriteString("\n")
+			fmt.Fprintln(w, s)
 		}
 	}
 	if o.data {
-		lines := hf.ToData(tm, o.deleted, o.onlyDeleted, o.limit, o.delimiter, fields, o.header)
-		for _, line := range lines {
-			out.WriteString(line)
-			out.WriteString("\n")
+		n, err := hf.StreamToData(tm, o.deleted, o.onlyDeleted, o.limit, o.delimiter, fields, o.header, writeLine(w))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
 		}
-		nRows = len(lines)
+		nRows = n
 	}
-	return out.String(), nRows, tm
+	return nRows, tm
+}
+
+// countTable 流式统计行数（不写文件）
+func countTable(abs string, o *options, tm *meta.TableMeta) int {
+	hf := newHeapFile(abs, o, filepath.Dir(abs), tm)
+	n, err := hf.StreamRowsCount(tm, o.deleted, o.onlyDeleted, o.limit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	return n
 }
 
 // exportDBAll 批量导出数据库（或 --schema 过滤的 schema）下所有普通表（对齐 pg2sql --tables/--all-tables）。
@@ -540,14 +610,26 @@ func exportDBAll(dbDir string, o *options) {
 			fmt.Fprintf(os.Stderr, "warning: 跳过 %s.%s（数据文件不存在: %s）\n", tm.Schema, tm.Relname, abs)
 			continue
 		}
-		out, nRows, _ := dumpOneTable(abs, o)
-		total += nRows
 		if o.count {
-			fmt.Printf("-- %s.%s: %d 行\n", tm.Schema, tm.Relname, nRows)
+			n := countTable(abs, o, tm)
+			fmt.Printf("-- %s.%s: %d 行\n", tm.Schema, tm.Relname, n)
+			total += n
 			continue
 		}
 		path := filepath.Join(o.output, defaultOutName(tm, ext))
-		writeOutput(path, out)
+		f, err := os.Create(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		w := bufio.NewWriterSize(f, 1<<20)
+		nRows, _ := streamTable(abs, o, w)
+		if err := w.Flush(); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		_ = f.Close()
+		total += nRows
 		vlog(o, "已导出: %s (%d 行)", path, nRows)
 	}
 	if o.verbose {
