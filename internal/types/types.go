@@ -1239,7 +1239,7 @@ var arrayTypeSet = map[int]bool{
 var _ = binary.U16
 
 // ---- openGauss 缺口类型：range / tsvector / tsquery / 几何 / pg_lsn / txid_snapshot / reg* / xml / macaddr8 ----
-// 移植自 pg2sql-go types.go（Author: raysuen），磁盘格式与 PostgreSQL/openGauss 同源。
+// 类型解码器（Author: raysuen），磁盘格式与 openGauss 同源。
 
 // ---- range 子类型 ----
 type rangeSub struct {

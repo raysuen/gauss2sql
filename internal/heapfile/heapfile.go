@@ -268,6 +268,9 @@ type HeapFile struct {
 	Parallel int // 页级并行工作数（>1 时 DumpRows 自动走并行路径）
 	badPages []int
 	pageSize int
+	// CorruptPages 记录最近一次 StreamSQL/StreamToData/StreamRowsCount 扫描过程中
+	// 遇到的坏页数量（v0.2.20，供 --report 导出报告使用；正常表恒为 0）。
+	CorruptPages int
 }
 
 // NewHeapFile 打开堆文件
@@ -963,6 +966,17 @@ func (h *HeapFile) runChunked(workers, nChunks int, limit int, process func(idx 
 		if next >= nChunks {
 			break
 		}
+		// v0.2.17：B 消化 next 跳变之后、阻塞读 resCh 之前，按最新 next 立即补派 goroutine 填满窗口。
+		// 旧版此补派只在循环顶部（A）执行：当 B 把在途 goroutine 结果全部连吃、next 一跳变后，
+		// 若在途已 drain 空而 A 尚未运行，C 会对着空 resCh 永久阻塞 → Go runtime fatal deadlock（间歇约 1/3）。
+		// 现补派后保证 next 一跳变就立刻填满 window（workers*2），C 永远有结果可收。
+		for sent < nChunks && (sent-next) < window {
+			i := sent
+			sent++
+			go func(i int) {
+				resCh <- process(i)
+			}(i)
+		}
 		co := <-resCh
 		pend[co.idx] = co
 	}
@@ -1131,6 +1145,7 @@ func (h *HeapFile) streamRowsCore(tm *meta.TableMeta, includeDeleted, onlyDelete
 	if err != nil {
 		return total, err
 	}
+	h.CorruptPages = len(badPages) // v0.2.20：记录坏页数供导出报告使用
 	if limit > 0 && total >= limit {
 		return total, nil
 	}

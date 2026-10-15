@@ -17,18 +17,19 @@ type Column struct {
 
 // TableMeta 一张表的元数据
 type TableMeta struct {
-	DBName      string
-	Schema      string
-	Relname     string
-	Relfilenode int
-	Reloid      int // pg_class OID（加载默认值/约束/注释用）
-	Columns     []*Column
-	Relkind     string
-	Hastoast    bool
-	Toastrelid  int
-	PrimaryKey  []string
-	TypeNames   map[int]string
-	RoleMap     map[int]string
+	DBName        string
+	Schema        string
+	Relname       string
+	Relfilenode   int
+	Reloid        int // pg_class OID（加载默认值/约束/注释用）
+	Reltablespace int // pg_class.reltablespace（0=pg_default，>0=pg_tblspc 符号链接 OID）
+	Columns       []*Column
+	Relkind       string
+	Hastoast      bool
+	Toastrelid    int
+	PrimaryKey    []string
+	TypeNames     map[int]string
+	RoleMap       map[int]string
 }
 
 // FullName schema.relname

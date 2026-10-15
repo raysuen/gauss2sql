@@ -2,7 +2,7 @@
 
 > 作者：raysuen
 
-> 当前版本：**v0.2.15**（变更记录见[第五节](#五变更记录)）
+> 当前版本：**v0.2.20**（变更记录见[第五节](#五变更记录)）
 
 > 离线解析 openGauss（含 openGauss 衍生库）数据目录堆文件并导出为 SQL / CSV / DDL / 元数据 JSON 的 Go 实现。
 
@@ -17,13 +17,15 @@ gauss2sql-go 是 gauss2sql（Python 版）的 **Golang 完整重写版**，功�
 
 ## 一、功能特性
 
-- `--list-db`：列出数据目录下全部数据库（OID → 库名映射）
-- `--list-tables-db`：列出指定数据库目录的用户对象（普通表/索引/序列/TOAST/视图，默认过滤系统 schema，对齐 pg2sql）
+- `--list-db`：列出数据目录下全部数据库（OID → 库名映射；v0.2.16 起多行追加该库在独立表空间下的目录路径）
+- `--db-id OID`（v0.2.16）：与 `--datadir` 组合直接定位单库（`<datadir>/base/<OID>`），驱动 `--list-tables-db`/`--table-name`/`--schema`/`--tables`；与位置参数并存、向后兼容
+- **独立表空间自动发现**（v0.2.16）：经 `pg_tblspc` 符号链接解析独立表空间里的表与 TOAST 文件真实路径，无需手动指定；pg_default 行为不变
+- `--list-tables-db`：列出指定数据库目录的用户对象（普通表/索引/序列/TOAST/视图，默认过滤系统 schema；v0.2.16 起含独立表空间里的表，正向遍历 pg_class）
 - `--list-tables-all`：列出指定数据库目录的全部对象（含系统 schema）
 - `--export-meta`：导出元数据 JSON（全部表结构，供 --catalog-json 使用）
 - `--ddl --sql`：导出表结构 DDL + INSERT 数据 SQL（DDL 含列 DEFAULT、表级 PRIMARY KEY / UNIQUE / CHECK 约束、表/列 COMMENT、`CREATE SEQUENCE` 前置、非主键唯一索引、数据尾部 setval 序列同步，v0.2.6 起）
 - `--data --output`：导出 CSV 数据文件（`--delimiter` 自定义分隔符，`--limit` 限行数）
-- `--tables / --all-tables / --schema`：批量导出（对齐 pg2sql）——位置参数为数据库目录，必须 `-o` 目录 + `--sql`/`--data`/`--ddl` 之一，每表一个 `<schema>.<对象名>.<sql|csv|ddl>` 文件
+- `--tables / --all-tables / --schema`：批量导出——位置参数为数据库目录，必须 `-o` 目录 + `--sql`/`--data`/`--ddl` 之一，每表一个 `<schema>.<对象名>.<sql|csv|ddl>` 文件（v0.2.18 起自动展开分区父表，输出 `<schema>.<父表名>.<ext>` 含全部子分区数据）
 - `--parallel N`：并行导出，输出与串行逐字节一致
 - `--deleted / --only-deleted`：导出（仅导出）已删除行（支持 ctid 定位）
 - `--count`：仅统计行数
@@ -64,6 +66,53 @@ gauss2sql-go 是 gauss2sql（Python 版）的 **Golang 完整重写版**，功�
 - 50GB 级大表导出峰值仅需 **~140MB（parallel 4）**，普通 2-4GB 内存服务器即可承载任意规模导出，无需预留输出大小 4-5 倍内存
 - `--parallel N` 内存近似线性：**≈35MB × N**（实测 4 worker 140MB），按机器内存余量选择并行度即可
 - 唯一随表增长的开销是**磁盘 IO 与耗时**（线性），内存不再是瓶颈
+
+### 「--jobs 与 --parallel 资源占用估算」（v0.2.20 起）
+
+批量导出支持两层正交并行：`--parallel N` 是**单表内部**页级并行（内层），`--jobs M` 是**表间**并行 worker 数（外层），二者可叠乘。
+
+**内存估算公式**：
+
+```
+总内存 ≈ 共享系统目录缓存（约 15MB）+ jobs × 单表流式峰值
+```
+
+单表流式峰值随 `--parallel` 增大而上升——`--parallel` 是单表内部页级并行，每多一个内层 worker 就多一份页级解析/转义缓冲；`--jobs` 是表间并行，每张并行导出的表各自占用一份单表流式峰值。
+
+**实测锚点**（openGauss 6.0.6、180 万行 1.47GB 表）：
+
+- 单表串行（parallel=1）：约 **28MB**
+- 单表 `--parallel 4`：约 **140MB**
+
+据此线性插值单表流式峰值：parallel=1 → 28MB、parallel=2 → 约 65MB、parallel=4 → 140MB。
+
+**估算峰值内存表（单位 MB，标注为"估算值"）**：
+
+| jobs \ parallel | parallel=1 | parallel=2 | parallel=4 |
+|---|---|---|---|
+| jobs=1 | ≈43 | ≈80 | ≈155 |
+| jobs=4 | ≈127 | ≈275 | ≈575 |
+| jobs=8 | ≈239 | ≈535 | ≈1135 |
+| jobs=16 | ≈463 | ≈1055 | ≈2255 |
+
+单元格 = 15MB 共享系统目录缓存 + jobs × 单表峰值（上表值）。
+
+> 实际占用受表宽、TOAST、坏页、并发 IO 影响，此表为**规划容量用估算**；大批量导出建议后台执行并观察 RSS。
+
+**CPU 公式**：
+
+```
+并发 worker 总数 ≈ jobs × parallel
+```
+
+建议不超过 CPU 物理核数 × 2；超过会因上下文切换和磁盘 IO 争抢反而变慢。
+
+**推荐配置**：
+
+- **3GB 内存沙箱/容器**：`jobs=4`、`parallel=2`（峰值约 275MB，留余量）
+- **8GB 生产环境**：`jobs=8`、`parallel=4`（峰值约 1.1GB）
+
+**其他 v0.2.20 新参数的开销**：`--batch-rows N` 几乎不额外耗内存（流式攒满 N 行即落盘），但会显著减少导出 SQL 文件的 INSERT 语句条数；`--report PATH` 仅为每表额外做一次 SHA-256，开销可忽略。
 
 ### 坏块（损坏页/损坏数据）健壮性支持（v0.2.8 起）
 
@@ -128,7 +177,7 @@ gauss2sql-go --datadir /data/openGauss --list-db
 gauss2sql-go base/16388 --list-tables-db
 gauss2sql-go base/16388 --list-tables-all
 
-# 批量导出用户表（对齐 pg2sql；位置参数为数据库目录，必须 -o 目录 + --sql/--data/--ddl）
+# 批量导出用户表（位置参数为数据库目录，必须 -o 目录 + --sql/--data/--ddl）
 gauss2sql-go base/16388 --tables --sql -o /tmp/out
 gauss2sql-go base/16388 --tables --schema app,public --sql -o /tmp/out
 gauss2sql-go base/16388 --all-tables --ddl -o /tmp/ddl   # 含系统 schema 纯 DDL，后缀 .ddl
@@ -172,7 +221,10 @@ gauss2sql-go base/16388/16414 --catalog-json meta.json --table-name app.t_del --
 | `--sql` | 输出 INSERT 数据 SQL（数据后追加 setval 序列同步） |
 | `--data` | 输出 CSV（需 `--output`；`--delimiter` 自定义分隔符） |
 | `--output` / `-o` | 输出到文件或目录；**未指定时输出到标准输出**；目录(以`/`结尾或已存在)自动生成 `<路径>/<schema>.<对象名>.<sql|csv|ddl>`；不带扩展名的路径自动追加 `.sql/.csv` |
-| `--parallel N` | 并行线程数 |
+| `--parallel N` | 单表内部页级并行线程数（内层，默认 1 串行；与 `--jobs` 正交叠乘） |
+| `--jobs M` | 批量导出表间并行 worker 数（外层，v0.2.20，默认 1 串行关闭；资源估算见上方「--jobs 与 --parallel 资源占用估算」） |
+| `--batch-rows N` | 多值 INSERT：每 N 行合并为一条 INSERT（v0.2.20，默认 0=关闭，即每行一条、与旧版逐字节一致） |
+| `--report PATH` | 导出结束写每表统计 JSON（v0.2.20，默认不写；含 schema/name/oid/rows/bytes/sha256/duration_ms/corrupt_pages） |
 | `--limit N` | 只导出前 N 行 |
 | `--delimiter STR` | CSV 字段分隔符（默认 `,`） |
 | `--deleted` | 包含已删除行 |
@@ -202,6 +254,51 @@ gauss2sql-go base/16388/16414 --catalog-json meta.json --table-name app.t_del --
 ---
 
 ## 五、变更记录
+
+- **v0.2.20（2026-10-14）**：**批量导出四项增强——多值 INSERT / 表间并行 / 统计报告 / 自动导入脚本（全部默认关闭）**——
+  - **`--batch-rows N`（多值 INSERT）**：每 N 行合并为一条 INSERT（列名只写一次）。默认 N=0 关闭，即每行一条 INSERT，与旧版逐字节一致。
+  - **`--jobs M`（表间并行）**：批量导出时表间并行 worker 数（外层）。默认 M=1 串行关闭；与 `--parallel N`（内层单表页级并行）正交，可叠乘。内存/CPU 占用估算见功能特性节「--jobs 与 --parallel 资源占用估算」。
+  - **`--report PATH`（导出统计 JSON）**：导出结束写一份每表统计 JSON（`version`/`database`/`tables[]`，每条含 `schema`/`name`/`oid`/`rows`/`bytes`/`sha256`/`duration_ms`/`corrupt_pages`）。默认不写。
+  - **自动生成 `import.sh`**：批量导出（`--tables`/`--all-tables`/`--schema`）结束后在 `-o` 目录自动生成 `import.sh`——按表名排序的 gsql 调用序列，DDL 先于数据 SQL，带目标库变量注释，`bash -n` 校验通过。
+  - **兼容性**：四项新功能全部默认关闭，未显式开启时输出与 v0.2.19 逐字节一致。
+
+- **v0.2.19（2026-10-13）**：**修复子分区表空间不解析缺陷——独立表空间子分区文件定位**——
+  - **缺陷**：v0.2.18 分区表修复后，子分区物理文件定位仍按父表/默认 `base/<dbOid>/` 兜底，未读子分区自己的 `reltablespace`：
+    - `ListPartitionFiles`（父表/批量路径）误调 `FindPhysicalFileByOid(abs, rfn)`（把 `rfn` 当 oid 查 `pg_class` 永远为空），再 `filepath.Join(abs, rfn)` 只在 `base/<dbOid>/` 找，独立表空间子分区整段漏定位；
+    - `lookupChildPartition`（`--table-name` 子表路径）`Reltablespace` 误用父表 `pg_class.reltablespace`，子分区建在与父表不同的独立表空间时定位错目录。
+  - **实测确认 `pg_partition` 列序（不凭猜）**：openGauss 6.0.6 与 5.0.5 上 `pg_attribute` 实测一致——`[0]relname name(64) [1]parttype char(1) [2]parentid oid(4) [3]rangenum int(4) [4]intervalnum int(4) [5]partstrategy char(1) [6]relfilenode oid(4) [7]reltablespace oid(4)`。`partitionFields` 据此补返回 `reltablespace`（fields[7]）；老版本无此列/为 NULL 时退化为父表表空间，不 panic。
+  - **修复**：
+    - `ListPartitionFiles` 删除无效的 `FindPhysicalFileByOid(abs, rfn)` 与 base 兜底，改为对每个子分区 `ResolvePhysicalFile(abs, childTbsp, rfn)`，`childTbsp==0` 回退父表 `reltablespace`；找不到文件向 stderr 告警并跳过（不静默）；
+    - `lookupChildPartition` 的 `Reltablespace` 改用子分区自己的 `pg_partition.reltablespace`（0 时回退父表），`ResolvePhysicalFile` 同步；
+    - 分区父表展开路径新增 `AutoDiscoverMetaInDir(f, dbDir, …)`：独立表空间子分区文件位于 `pg_tblspc/<ts>/PG_ver/<dbOid>/<rfn>`，其所在目录只有用户数据文件、不含 `pg_class`/`pg_partition`，须传真正的 `base/<dbOid>` 才能回查系统目录。
+  - **4 组合测试结论（openGauss 6.0.6，建 ts1=40960/ts2=40961/ts3=40962）**：
+    - **A 父默认+子全默认（基线）**：父表导出 199 行，与 v0.2.18 行为一致；
+    - **B 父 ts1+子继承 ts1**：父表导出 199 行，子分区 `p_b1=99/p_b2=100`；
+    - **C 父默认+p_c1 ts2/p_c2 默认**：父表导出 199 行，`p_c1=99`(ts2)/`p_c2=100`(base)；
+    - **D 父 ts1+p_d1 ts3/p_d2 ts1**：父表导出 199 行，`p_d1=99`(ts3)/`p_d2=100`(ts1)；
+    - 每种组合均：①`--table-name` 父表名导出全部子分区行数正确；②`--table-name` 子分区名导出该子分区行数正确；③批量 `--all-tables --sql -o` 分区表文件含全部子分区数据；④导出 SQL 导入新库逐值 md5 一致；⑤stderr 无"无子分区数据文件"错误（B/C/D）。
+  - **回归**：默认表空间分区表（既有测试场景）行为不变；data_v50/base/16385/16395 12 模式 md5、坏块 3 模式、180 万行 parallel 不死锁、50 字段 50052 行与 v0.2.18 逐字节一致；openGauss 5.0.0~6.0.6 共 12 版本全功能回归 ALL PASS。
+
+- **v0.2.18（2026-10-13）**：**分区表两项补全——批量导出展开分区父表 + `--table-name` 子分区名单独导出**——
+  - **批量导出不再遗漏分区父表**：`exportDBAll` 旧版 `if tm.Relkind != "r" { continue }` 把分区父表连同索引/序列一并跳过，且 `AutoDiscoverAllTablesOrdered` 只遍历 `pg_class`，导致 `--all-tables/--tables/--schema/--export-db` 批量导出**静默遗漏全部分区表数据、无任何 warning**。openGauss 传统分区父表在 `pg_class` 中 `relkind='r'`（非 PostgreSQL 的 `'p'`）且 `relfilenode` 兜底为父表 OID、自身无独立堆文件，仅靠 `relkind` 无法识别：新增 `catalog.PartitionParentOids` 一次性扫 `pg_partition` 建立"拥有子分区(rfn>0)的父表 OID 集合"，批量循环据此把父表路由到展开路径——`--count` 走 `countPartitionParent`（各子分区行数求和），否则走 `exportPartitionParentToWriter`（DDL 一次 + 逐子分区流式数据 + 统一 setval），输出到 `-o` 目录下 `<schema>.<父表名>.<ext>`。普通表(`relkind='r'`)路径零改动。
+  - **重构复用**：把 v0.2.13 `exportPartitionParent` 的 count 分支与写盘核心抽成 `countPartitionParent` / `exportPartitionParentToWriter`，单表 `--table-name <父表>` 行为完全不变，批量路径复用同一展开逻辑（统一输出 writer 到 `-o` 目录文件，不再自开 stdout）。
+  - **`--table-name` 支持子分区名单独导出**：`FindTableMetaByName` 旧版只遍历 `pg_class`，传统分区子分区（p2024/p2025...）不在 `pg_class` → `--table-name p2024` 报"未找到表"。现 pg_class 零命中时回查 `pg_partition`：按 `relname` 匹配子分区 → `parentid` 回 `pg_class` 取父表 schema/列定义(`attByRel[parentid`)/表空间/TOAST → `Relfilenode` 置为子分区自身 `rfn(>0)`、`Relkind='r'`，走普通表 `streamKnownTable` 分支单独导出该子分区，输出文件名自动为 `<schema>.<子分区名>.<ext>`。消歧原则：pg_class 普通表优先（pg_class 命中即 return，不进兜底）；裸名跨多个父 schema 命中时报错提示用 `schema.table`。
+  - **实测（openGauss 6.0.6）**：建 `app.t_rng` RANGE 分区 3 子分区（含中文/特殊字符/变长大字段）共 2999 行——①批量 `--all-tables --sql` 产出 `app.t_rng.sql` 含全部 2999 行且中文/特殊字符完整；②`--table-name app.t_rng` 导出 2999 行（父表展开）；③`--table-name p2024/p2025/p2026` 分别导出 999/1000/1000 行，文件名为 `app.p2024.sql`；④批量 `--count` 报 `app.t_rng: 2999 行`；导出 SQL 导入新库逐值一致（id=1000 特殊字符、id=2999 分区字符均正确还原）。
+  - **回归**：无表空间库普通表单表 `--sql/--csv` 输出与 v0.2.17 旧二进制 md5 逐字节一致（all_types/simple/toast/jb/tid）；批量 `--all-tables` 在无分区库（data_v50 big50）106 个文件递归 diff 与 v0.2.17 完全一致；`--count 16395=50052`；`--parallel=4` 大表 50052 行不死锁。
+
+- **v0.2.17（2026-10-13）**：**两项修复——并行分片间歇死锁 + `--list-tables-all` 幽灵路径过滤**——
+  - **修复并行分片间歇死锁**：`internal/heapfile/heapfile.go` 的 `runChunked` 并行主循环，旧版窗口补派发（按当前 `next` 补满 `window=workers*2` 的 goroutine）只在每轮循环顶部（A）执行；当 B 连续消化 `pend[next..]` 使 `next` 一跳变、在途 goroutine 结果全部 drain 进 `pend` 并被连吃后，代码直接落到 C 阻塞读 `resCh`，此时在途已空而 A 尚未运行，C 永久阻塞 → Go runtime fatal deadlock（rc=2、输出截断约 4 万行，间歇约 1/3）。现把"按最新 `next` 补满 window 的派发"挪到 **B 消化 `next` 跳变之后、C 阻塞读 `resCh` 之前**，保证 `next` 一跳变就立刻补派新 goroutine 填满窗口，C 永远有结果可收；`workers==1` 串行分支保持不变。实测 1.8M 行大表 `--sql --parallel 4` 连续 10 次全部 rc=0、不死锁、不截断，且 p4 输出 md5 与串行逐字节一致；内存峰值不退化（串行 ~28MB / p4 ~140MB）。
+  - **`--list-tables-all` 增加 stat 物理文件过滤**：`main.go` `listTablesDB` 正向遍历 `pg_class` 得到对象、解析出物理路径后（`catalog.ResolvePhysicalFile` 返回值，或回退 `filepath.Join(dbDir, relfilenode)`），先 `os.Stat(path)`：**文件真实存在才 append 成 row 输出，不存在则跳过该行**，去除视图 / 共享表（文件在 `global/` 不在 `base/<dboid>/`）/ 复合类型等无对应物理文件对象的幽灵路径。覆盖 `--list-tables-all`（`all=true`）与 `--list-tables-db`（`all=false`）两种模式；`--list-tables-db` 仍先按原 `isSystemSchema` 过滤（`pg_*`/`dbe_*`/`pkg_*` 前缀 + `information_schema`/`coverage`/`db4ai`/`snapshot`），stat 过滤在其后。保留现有"扫 `base/<dbOid>` 数字文件、孤儿标 `(未知/系统表)`"循环不动（那些是磁盘上真实存在的文件）。实测无表空间库 `--list-tables-all`/`--list-tables-db` 输出与 v0.2.15 旧二进制 md5 逐字节一致（`--list-tables-all` 384 行）；表空间库中两表经 `pg_tblspc` 解析真实路径 stat 通过并正常列出，视图/共享表/复合类型幽灵行被过滤。
+  - **回归**：无表空间库全矩阵（list-db/list-tables-db/list-tables-all/export-meta/ddl+sql/csv/parallel/count/deleted/only-deleted/分区/TOAST/jsonb/tid/50 字段 50052 行表 16395/坏块 3 模式）输出与 v0.2.16 逐字节一致；openGauss 5.0.0~6.0.6 共 12 版本全功能回归 ALL PASS；data_vcat 坏页模式内部一致。无新 CLI 参数，`--help` 无需变更。
+
+- **v0.2.16（2026-10-13）**：**openGauss 独立表空间自动发现（向后兼容）+ `--db-id` 参数**——
+  - **表空间感知的物理文件定位**：`pg_class` 新增提取 `reltablespace`（fields[7]）。表/TOAST 文件不再只按 `<datadir>/base/<dbOid>/<relfilenode>` 查找，而是经 `<datadir>/pg_tblspc/<reltablespace>` 符号链接 → `PG_*` 版本子目录 → `<dbOid>/<relfilenode>` 解析真实路径；`reltablespace=0`（pg_default）时完全等价旧路径。`FindPhysicalFileByOid`/`FindTableMetaByName`/`exportDBAll`/`listTablesDB` 统一走该解析，TOAST 表随父表同表空间自动定位（实测 openGauss 6.0.6：`pg_tblspc/40960 -> /tmp/og_tbs1/PG_9.2_201611171_single_node/<dbOid>/<rfn>`，布局记录于 `_baseline/TBS_LAYOUT.md`）。
+  - **`--db-id OID` 新参数**：与 `--datadir` 组合时 `dbDir = <datadir>/base/<OID>`，可直接驱动 `--list-tables-db`/`--table-name`/`--schema`/`--tables` 等导出模式，无需再拼出 `base/<oid>` 路径。与位置参数并存、向后兼容：老命令 `gauss2sql base/16388 --list-tables-db` 行为逐字不变。
+  - **`--list-db` 多行显示表空间路径**：每库 `base/<oid>` 一行后，追加该库在各独立表空间下的目录路径（无表空间的库输出与旧版逐字一致）。
+  - **`--list-tables-db` 改正向遍历**：以 `pg_class` 为准定位全部表（含表空间里的表），用 `reltablespace` 解析真实文件路径；保留 `!all && isSystemSchema` 过滤与 base 下孤立文件的 `(未知/系统表)` 行——无表空间库输出与旧版逐字一致（md5 对照）。
+  - **`pkg_*` 系统 schema 过滤**：`isSystemSchema` 补充 `pkg_` 前缀（openGauss 系统包 schema），默认 `--list-tables-db`/批量导出排除。
+  - **~~已知限制~~（v0.2.19 已修复）**：分区/子分区表空间——`pg_partition` 实测 8 列含 `reltablespace`（fields[7]，openGauss 5.0.x 与 6.0.x 一致），分区表建在独立表空间时其叶子子分区文件现按子分区自己的 `reltablespace` 解析定位（0 时回退父表表空间），`--table-name` 子表路径与批量父表路径均正确。多段文件（`.1`/`.2`...）沿用现有多段逻辑，主段定位正确。
+  - **实测**：openGauss 6.0.6 建 tbs1/tbs2 两独立表空间，分布建 TOAST 大字段表 / 中文特殊字符表 / pg_default 对照表，停库后离线实测 5 项冒烟通过；data_v50 单库与 v0.2.15 旧二进制 `--list-tables-db`/`--count` 输出 md5 逐字节一致。
 
 - **v0.2.15（2026-10-10）**：文档轮——README 功能特性「大表流式导出与多段文件支持」小节新增**「内存恒定：流式化的核心收益（v0.2.14 起）」**详细描述：固定窗口流式原理（串行同步零积压 / 并行有界窗口派发）、实测对比表（v0.2.12 需 ~3.3GB+、v0.2.13 并发扇出 3.26GB、v0.2.14 串行 28MB / parallel 4 140MB）、5-50GB 内存恒定外推表、实践意义（50GB 导出仅需 ~140MB、≈35MB×N 线性规则）。无代码逻辑变更，仅文档；版本号同步 +0.1。
 
@@ -239,12 +336,12 @@ gauss2sql-go base/16388/16414 --catalog-json meta.json --table-name app.t_del --
   - **D5 attrFields boolf**：`fields[i]` 空切片 panic（被 defer 吞后列静默丢失）→ len 检查。
   - **回归**：openGauss 6.0.6 实测——timetz/数组 NULL 与 `::text` 权威输出逐值一致；t_big 20000 行破坏第 1/100 页不 panic 不丢行；坏 varlena 截断不崩溃；CLI 缺参 exit 2；坏 meta.json 安全退出；正常数据 SQL/CSV/DDL 与 v0.2.7 **逐字节一致（md5 相同）**无回归；12 正式版全功能回归详见 REGRESSION-GO.md。
 - **v0.2.7（2026-10-08）**：**修复 DDL 索引导出重复缺陷**——v0.2.6 的 `--ddl` 增强在导出 `UNIQUE` 约束时，约束已内联进 `CREATE TABLE ... CONSTRAINT "x" UNIQUE (...)`（该约束会隐式创建同名索引），导出器却又额外 emit 一条独立 `CREATE UNIQUE INDEX "x"`，导致严格导入（`ON_ERROR_STOP=1`）在该索引处 abort：`ERROR: relation "x" already exists`（典型样本 `t_ddl_enhance_uniq_col_key`）。根因：索引导出只过滤了 `indisprimary`（PK backing），未区分"约束 backing 索引"（pg_constraint.conindid 指向、contype in p/u）与"独立二级索引"（pg_constraint 无记录）。修复（internal/catalog/catalog.go）：`constraintFields` 提取 conindid（pg_constraint 布局字段 8），`ConstraintInfo` 新增 `Conindid`；新增 `loadBackingIndexOids`，`LoadIndexes` 发射 `CREATE [UNIQUE] INDEX` 时跳过其 OID 被 contype in ('p','u') 约束 conindid 引用的索引——PK/UNIQUE 约束内联声明后不再重复建索引，纯独立二级索引（含非约束唯一索引，如 `t_new_types_u1`）照常导出。实测 6.0.6 `t_ddl_enhance` 不再有重复 `CREATE UNIQUE INDEX`，完整 SQL 导入新库 `ON_ERROR_STOP=1` 零报错逐值一致；无约束/无索引表 `t_all_types` 与基线（md5 `dc1154c2825ebfe37381bf4dbea5395c` / 9901B）逐字节一致（无回归）。
-- **v0.2.6（2026-10-08）**：**对齐 pg2sql-go 五项功能补齐（差异清单 1/2/3/4/5）**——
-  ①**类型解码补全**（internal/types）：新增 range 全系（int4/num/ts/tstz/date/int8 range，按 openGauss 磁盘格式解码边界/empty）、tsvector（WordEntry 权重位）、tsquery（QueryItem NOT/AND/OR/PHRASE）、几何 7 型（point/lseg/path/box/polygon/line/circle）、txid_snapshot（openGauss OID=2970 与 PG 5030 不同，布局 [nxip][xmin8][xmax8][extra][xip8]，经 txid_snapshot_send 权威校准）、reg* 系列（regclass/regproc/regtype 等，输出 OID 数字与 pg2sql 一致可逆导入）、xml（剥 4B 类型标记）、macaddr8/pg_lsn（防御保留，openGauss 无此类型）；实测 range/tsvector/几何/xml/txid_snapshot 与 gsql 输出逐值一致，SQL 导入新库 6/6 零差异。
+- **v0.2.6（2026-10-08）**：**五项功能补齐**——
+  ①**类型解码补全**（internal/types）：新增 range 全系（int4/num/ts/tstz/date/int8 range，按 openGauss 磁盘格式解码边界/empty）、tsvector（WordEntry 权重位）、tsquery（QueryItem NOT/AND/OR/PHRASE）、几何 7 型（point/lseg/path/box/polygon/line/circle）、txid_snapshot（openGauss OID=2970 与 PG 5030 不同，布局 [nxip][xmin8][xmax8][extra][xip8]，经 txid_snapshot_send 权威校准）、reg* 系列（regclass/regproc/regtype 等，输出 OID 数字可逆导入）、xml（剥 4B 类型标记）、macaddr8/pg_lsn（防御保留，openGauss 无此类型）；实测 range/tsvector/几何/xml/txid_snapshot 与 gsql 输出逐值一致，SQL 导入新库 6/6 零差异。
   ②**DDL 序列 + setval 同步**（internal/catalog + main.go）：新增 pg_index 解析（openGauss pg_index 目录 OID=2610、列序 indisunique@10/indisprimary@11 与 PG 不同，indkey 用 varlena 定位法兼容布局差异）；`--ddl` 在 CREATE TABLE 前输出 `CREATE SEQUENCE IF NOT EXISTS`（被 DEFAULT nextval 引用的序列，按当前 schema 补全裸名），CREATE TABLE 后输出非主键 `CREATE INDEX`/`CREATE UNIQUE INDEX`（表达式/部分索引跳过）；`--sql` 数据尾部追加 `SELECT setval(...)` 序列同步（导入后自增从最大值继续，实测新插入 id 从 max+1 起）。
   ③**新增 `--limit`/`--delimiter` 参数**：`--limit N` 只导出前 N 行；`--delimiter STR` 自定义 CSV 分隔符（默认 `,`，与 COPY DELIMITER 兼容）。
-  ④⑤**批量导出与列表参数对齐 pg2sql**：废弃半成品 `--export-db`，改为 `--tables`（用户表）/`--all-tables`（含系统 schema）/`--schema`（schema 过滤，逗号多值，独立触发批量）；批量模式位置参数为数据库目录、必须 `-o` 目录 + `--sql`/`--data`/`--ddl` 之一，纯 DDL 输出后缀 `.ddl`；`--list-tables-db` 改为只列用户对象（过滤 pg_*/dbe_*/information_schema/coverage/db4ai/snapshot 系统 schema），新增 `--list-tables-all` 列全部对象（均带 schema 前缀）。
-  回归：真实 openGauss 6.0.6 集群新类型造数导出-导入闭环通过；12 个正式版本全功能回归见 `REGRESSION-GO.md`。**已知边界**：openGauss 无 line/pg_lsn/macaddr8 类型（解码器保留防御）；reg* 输出 OID 数字（对齐 pg2sql 语义，`'数字'::regclass` 可逆）。
+  ④⑤**批量导出与列表参数**：废弃半成品 `--export-db`，改为 `--tables`（用户表）/`--all-tables`（含系统 schema）/`--schema`（schema 过滤，逗号多值，独立触发批量）；批量模式位置参数为数据库目录、必须 `-o` 目录 + `--sql`/`--data`/`--ddl` 之一，纯 DDL 输出后缀 `.ddl`；`--list-tables-db` 改为只列用户对象（过滤 pg_*/dbe_*/information_schema/coverage/db4ai/snapshot 系统 schema），新增 `--list-tables-all` 列全部对象（均带 schema 前缀）。
+  回归：真实 openGauss 6.0.6 集群新类型造数导出-导入闭环通过；12 个正式版本全功能回归见 `REGRESSION-GO.md`。**已知边界**：openGauss 无 line/pg_lsn/macaddr8 类型（解码器保留防御）；reg* 输出 OID 数字（`'数字'::regclass` 可逆）。
 - **v0.2.5（2026-09-30）**：文档与帮助文本同步轮——README 头部当前版本标注更新为 **v0.2.5**；功能特性 `--ddl` 描述补充 DDL 增强说明（默认值/主键/唯一/CHECK/注释）；`--help` 的 `--ddl` 说明同步更新为"输出 CREATE TABLE DDL（含默认值/主键/唯一/CHECK/表列注释）"。无逻辑变更，仅文档与帮助文本。
 - **v0.2.4（2026-09-29）**：**修复 DDL 增强（P1-④）3 处源码 bug**——v0.2.3 的 `--ddl` 增强在真实 openGauss 集群上实测完全不生效，本轮修复后 8 项增强元素齐全且无乱码：①`pgAttrdefOID` 由错误的 `2600`（实为 pg_aggregate）改正为 **2604**（pg_attrdef 全版本 OID），列 `DEFAULT`（含 `nextval(...)`/`'unknown'`/`0`）不再丢失；②`pg_constraint` 列布局重排——删除 openGauss 不存在的幻影列 `conparentid`，补齐 6.0.x 新增的 `conislocal/coninhcount/connoinherit/consoft/conopt` 5 列，修正后 `conkey=18`、`consrc=25`（此前偏移错位致 PK/UNIQUE/CHECK 全丢），同时 `decodeInt2Array` 改走 `VarlenaParse` 剥头并跳过数组维头（nelems+lowerbound 8B），主键列不再被重复展开成 `("id","id","id")`；③`LoadDescriptions`/`attrdefFields`/`constraintFields` 的 varlena 文本字段统一经 `varlenaText()` 剥 1B/4B varlena 头取负载，表/列注释不再带前导脏字节（此前表注释 `'DDL增强测试表`、列注释 `=状态:...`）。实测：`--ddl` 8/8 元素齐全、导出 SQL 导入新库逐值零差异、catalog-json 与直连逐字节一致、无约束表 t_all_types 与 v0.2.2 逐字节一致（无回归）。**已知边界**：`DEFAULT nextval(...)` 引用的序列本轮仍不导出 `CREATE SEQUENCE`，导入前需手动 `CREATE SEQUENCE`（或在新库先建序列），否则建表报 `relation "..._seq" does not exist`。
 - **v0.2.3（2026-09-29）**：**DDL 增强（P1-④）**——`--ddl` 新增输出：列 `DEFAULT`（解析 pg_attrdef 的 adsrc，含序列 nextval 默认值）、表级约束 `PRIMARY KEY` / `UNIQUE` / `CHECK`（解析 pg_constraint 的 conkey/consrc，跳过外键与未验证约束）、`COMMENT ON TABLE/COLUMN`（解析 pg_description，引号转义）；meta.json 表对象新增 `oid` 字段，`primary_key` 首次真正填充（此前恒空）；`--catalog-json` 模式重建 Reloid 后同样可输出增强 DDL；无约束/默认值/注释的表 DDL 与旧版逐字节一致（无回归）；export-meta 预分组约束避免每表全扫 pg_constraint。

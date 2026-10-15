@@ -42,8 +42,8 @@ var pgEncodingToCodec = map[int]string{
 	3:  "euc_kr",
 	4:  "euc_tw",
 	5:  "euc_jis_2004",
-	6:  "gbk",    // 简体中文（GBK）
-	7:  "utf-8",  // UTF-8
+	6:  "gbk",   // 简体中文（GBK）
+	7:  "utf-8", // UTF-8
 	8:  "mule_internal",
 	9:  "latin-1",
 	10: "latin-2",
@@ -110,9 +110,18 @@ var ogAttrLayout = func() []colItem {
 
 var ogNSCols = []colItem{{64, false, "c"}, {4, false, "i"}}
 
+// pg_partition 物理列序（openGauss 5.0.x 与 6.0.x 实测一致）：
+//
+//	[0] relname name(64c)  [1] parttype char(1c)  [2] parentid oid(4i)
+//	[3] rangenum int4(4i)  [4] intervalnum int4(4i) [5] partstrategy char(1c)
+//	[6] relfilenode oid(4i) [7] reltablespace oid(4i)
+//
+// v0.2.19：补 [7] reltablespace——子分区可位于独立表空间，旧版只取前 7 列、
+// 用父表/默认 base 目录兜底，导致独立表空间子分区文件定位失败。
 var ogPartitionCols = []colItem{
 	{64, false, "c"}, {1, false, "c"}, {4, false, "i"},
 	{4, false, "i"}, {4, false, "i"}, {1, false, "c"}, {4, false, "i"},
+	{4, false, "i"},
 }
 
 // pg_attrdef (OID 2600): adrelid oid, adnum int2, adbin pg_node_tree, adsrc text
@@ -122,11 +131,12 @@ var ogAttrdefCols = []colItem{
 }
 
 // pg_constraint (OID 2606): conname name, connamespace oid, contype char,
-//   condeferrable/condeferred/convalidated bool, conrelid oid, contypid oid,
-//   conindid oid, confrelid oid, confupdtype/confdeltype/confmatchtype char,
-//   conislocal bool, coninhcount int4, connoinherit/consoft/conopt bool,
-//   conkey int2[], confkey int2[], conpfeqop/conppeqop/conffeqop/conexclop oid[],
-//   conbin pg_node_tree, consrc text
+//
+//	condeferrable/condeferred/convalidated bool, conrelid oid, contypid oid,
+//	conindid oid, confrelid oid, confupdtype/confdeltype/confmatchtype char,
+//	conislocal bool, coninhcount int4, connoinherit/consoft/conopt bool,
+//	conkey int2[], confkey int2[], conpfeqop/conppeqop/conffeqop/conexclop oid[],
+//	conbin pg_node_tree, consrc text
 var ogConstraintCols = []colItem{
 	{64, false, "c"}, {4, false, "i"}, {1, false, "c"},
 	{1, false, "c"}, {1, false, "c"}, {1, false, "c"},
@@ -272,12 +282,13 @@ func cstring(b []byte) string {
 
 // classRow pg_class 一行
 type classRow struct {
-	oid         int
-	relname     string
-	relns       int
-	relfilenode int
-	relkind     string
-	toastrelid  int
+	oid           int
+	relname       string
+	relns         int
+	relfilenode   int
+	relkind       string
+	toastrelid    int
+	reltablespace int
 }
 
 // classFields 解析 pg_class 行；失败返回 nil
@@ -311,21 +322,27 @@ func classFields(t *tuple.HeapTuple) *classRow {
 	if len(fields) > 11 && fields[11] != nil && len(fields[11]) >= 4 {
 		toastrelid = int(binary.U32(fields[11], 0))
 	}
-	return &classRow{oid, relname, int(relns), relfilenode, relkind, toastrelid}
+	// fields[7] = reltablespace（pg_tblspc 符号链接 OID；0 = pg_default）。
+	// openGauss 6.0.6 实测：独立表空间对象及其 TOAST 表均带非 0 reltablespace。
+	reltablespace := 0
+	if len(fields) > 7 && fields[7] != nil && len(fields[7]) >= 4 {
+		reltablespace = int(binary.U32(fields[7], 0))
+	}
+	return &classRow{oid, relname, int(relns), relfilenode, relkind, toastrelid, reltablespace}
 }
 
 // AttrRow pg_attribute 行
 type AttrRow struct {
-	Attrelid int
-	Attname  string
-	Atttypid int
-	Attlen   int
-	Attnum   int
-	Typmod   int
-	Notnull  bool
-	Dropped  bool
-	Attalign string
-	Attbyval bool
+	Attrelid   int
+	Attname    string
+	Atttypid   int
+	Attlen     int
+	Attnum     int
+	Typmod     int
+	Notnull    bool
+	Dropped    bool
+	Attalign   string
+	Attbyval   bool
 	Attstorage string
 }
 
@@ -397,11 +414,14 @@ func nsFields(t *tuple.HeapTuple) (int, string) {
 	return t.GetOid(), cstring(fields[0])
 }
 
-func partitionFields(t *tuple.HeapTuple) (relname, parttype string, parentid, rfn int) {
+// partitionFields 解析 pg_partition 元组（v0.2.19 起多返回 reltablespace）。
+// reltablespace 为子分区自己的表空间 OID（0=继承/默认）；读不到或老版本无此列时返回 0，
+// 由调用方回退父表 reltablespace，绝不 panic。
+func partitionFields(t *tuple.HeapTuple) (relname, parttype string, parentid, rfn, reltablespace int) {
 	defer func() { recover() }()
 	fields := heapfile.ExtractFieldsDirect(t.Raw, int(t.HOff), t.GetNulls(), ogPartitionCols)
 	if len(fields) < 7 || fields[0] == nil {
-		return "", "", 0, 0
+		return "", "", 0, 0, 0
 	}
 	relname = cstring(fields[0])
 	parttype = ""
@@ -416,6 +436,11 @@ func partitionFields(t *tuple.HeapTuple) (relname, parttype string, parentid, rf
 	if fields[6] != nil && len(fields[6]) >= 4 {
 		rfn = int(binary.U32(fields[6], 0))
 	}
+	reltablespace = 0
+	// v0.2.19：fields[7] = reltablespace（oid/uint32）。老版本列不足或字段为 NULL 时保持 0。
+	if len(fields) >= 8 && fields[7] != nil && len(fields[7]) >= 4 {
+		reltablespace = int(binary.U32(fields[7], 0))
+	}
 	return
 }
 
@@ -424,10 +449,10 @@ func partitionFields(t *tuple.HeapTuple) (relname, parttype string, parentid, rf
 // ConstraintInfo 表级约束（主键/唯一/CHECK）
 type ConstraintInfo struct {
 	Name     string
-	Type     byte  // 'p' 主键, 'u' 唯一, 'c' CHECK
-	Cols     []int // conkey（列号，主键/唯一）
+	Type     byte   // 'p' 主键, 'u' 唯一, 'c' CHECK
+	Cols     []int  // conkey（列号，主键/唯一）
 	Src      string // consrc（CHECK 表达式文本）
-	Conindid int   // conindid：约束 backing 索引 OID（p/u 约束内联建表时隐式创建的同名索引）
+	Conindid int    // conindid：约束 backing 索引 OID（p/u 约束内联建表时隐式创建的同名索引）
 }
 
 func attrdefFields(t *tuple.HeapTuple) (relid, attnum int, adsrc string) {
@@ -712,8 +737,20 @@ func loadNSMap(dbDir string) map[int]string {
 // AutoDiscoverMeta 从单个数据文件发现表结构
 func AutoDiscoverMeta(dataFile string, pageSize int) *meta.TableMeta {
 	abs, _ := filepath.Abs(dataFile)
+	return discoverMeta(abs, filepath.Dir(abs), pageSize)
+}
+
+// AutoDiscoverMetaInDir 与 AutoDiscoverMeta 相同，但显式指定系统目录所在的 dbDir（base/<dbOid>）。
+// v0.2.19：独立表空间子分区物理文件位于 pg_tblspc/<ts>/PG_ver/<dbOid>/<rfn>，其所在目录只存放
+// 该库用户数据文件、不含 pg_class/pg_partition；分区父表展开时须传真正的 dbDir（base/<dbOid>），
+// 否则 tryPartitionFallback 找不到系统目录、独立表空间子分区被静默跳过。
+func AutoDiscoverMetaInDir(dataFile, dbDir string, pageSize int) *meta.TableMeta {
+	abs, _ := filepath.Abs(dataFile)
+	return discoverMeta(abs, dbDir, pageSize)
+}
+
+func discoverMeta(abs, dbDir string, pageSize int) *meta.TableMeta {
 	filename := filepath.Base(abs)
-	dbDir := filepath.Dir(abs)
 	targetRF, _ := strconv.Atoi(filename)
 
 	pgClassPath := SysFilePath(dbDir, pgClassOID)
@@ -727,6 +764,7 @@ func AutoDiscoverMeta(dataFile string, pageSize int) *meta.TableMeta {
 	var targetRelkind string
 	var targetNSInt int
 	var targetToastrelid int
+	var targetReltbs int
 	iterateTuples(pgClassPath, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
 		row := classFields(t)
 		if row == nil {
@@ -738,6 +776,7 @@ func AutoDiscoverMeta(dataFile string, pageSize int) *meta.TableMeta {
 			targetNSInt = row.relns
 			targetRelkind = row.relkind
 			targetToastrelid = row.toastrelid
+			targetReltbs = row.reltablespace
 			return false
 		}
 		return true
@@ -779,7 +818,8 @@ func AutoDiscoverMeta(dataFile string, pageSize int) *meta.TableMeta {
 	sort.Slice(cols, func(i, j int) bool { return cols[i].Attnum < cols[j].Attnum })
 	tm := &meta.TableMeta{
 		DBName: filepath.Base(dbDir), Schema: schema, Relname: targetRelname,
-		Relfilenode: targetRF, Reloid: targetOid, Columns: cols, Relkind: targetRelkind,
+		Relfilenode: targetRF, Reloid: targetOid, Reltablespace: targetReltbs,
+		Columns: cols, Relkind: targetRelkind,
 		Toastrelid: targetToastrelid,
 		TypeNames:  BuildTypeNameMap(dbDir),
 	}
@@ -814,7 +854,7 @@ func tryPartitionFallback(dbDir string, targetRF, pageSize int) *meta.TableMeta 
 	}
 	var parentOid int
 	iterateTuples(partPath, pageSize, func(pno, idx int, t *tuple.HeapTuple) bool {
-		_, parttype, parentid, rfn := partitionFields(t)
+		_, parttype, parentid, rfn, _ := partitionFields(t)
 		if rfn == targetRF && parttype == "p" {
 			parentOid = parentid
 			return false
@@ -888,25 +928,99 @@ func primaryKeyCols(cs []ConstraintInfo, cols []*meta.Column) []string {
 	return nil
 }
 
-// FindPhysicalFileByOid 按表 OID 查 pg_class 取物理 relfilenode 文件名
+// resolveTablespaceFile 表空间感知的物理文件定位（v0.2.16）。
+// 输入 dbDir（= <datadir>/base/<dbOid>）、reltablespace（pg_class.reltablespace）、rfn（relfilenode），
+// 返回存在的物理文件绝对路径；任何一环失败返回 ""，调用方回退旧行为 <dbDir>/<rfn>，
+// 保证无独立表空间的库行为与旧版逐字一致。
+//
+// 解析规则（实测 _baseline/TBS_LAYOUT.md）：
+//   - reltablespace==0（pg_default）：<dbDir>/<rfn>
+//   - reltablespace!=0：readlink <datadir>/pg_tblspc/<reltablespace> → <target>；
+//     在 <target> 下找名字以 "PG_" 开头的版本子目录（每集群大版本唯一）；
+//     候选 = <target>/<PG_ver>/<dbOid>/<rfn>
+func resolveTablespaceFile(dbDir string, reltablespace int, rfn int) string {
+	if rfn <= 0 {
+		return ""
+	}
+	rfnStr := strconv.Itoa(rfn)
+	// reltablespace==0：pg_default，文件就在 dbDir 下（旧行为）
+	if reltablespace == 0 {
+		p := filepath.Join(dbDir, rfnStr)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+		return ""
+	}
+	// datadir = dirname(dirname(dbDir))；dbDir = <datadir>/base/<dbOid>
+	datadir := filepath.Dir(filepath.Dir(dbDir))
+	dbOid := filepath.Base(dbDir)
+	link := filepath.Join(datadir, "pg_tblspc", strconv.Itoa(reltablespace))
+	target, err := os.Readlink(link)
+	if err != nil {
+		return ""
+	}
+	// 目标目录下找 PG_ 开头的版本子目录
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		return ""
+	}
+	verDir := ""
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "PG_") {
+			verDir = e.Name()
+			break
+		}
+	}
+	if verDir == "" {
+		return ""
+	}
+	p := filepath.Join(target, verDir, dbOid, rfnStr)
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return ""
+}
+
+// ResolvePhysicalFile 表空间感知定位（导出/列表用，v0.2.16）：
+// 按 dbDir(=<datadir>/base/<dbOid>) + reltablespace + rfn 定位主段物理文件。
+// 表空间路径命中即返回；否则回退旧行为 <dbDir>/<rfn>；均不存在返回 ""。
+// 对 reltablespace=0 的库，结果与旧版 filepath.Join(dbDir,rfn) 逐字一致。
+func ResolvePhysicalFile(dbDir string, reltablespace int, rfn int) string {
+	if p := resolveTablespaceFile(dbDir, reltablespace, rfn); p != "" {
+		return p
+	}
+	p := filepath.Join(dbDir, strconv.Itoa(rfn))
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return ""
+}
+
+// FindPhysicalFileByOid 按表 OID 查 pg_class 取物理 relfilenode 文件名（表空间感知，v0.2.16）。
 func FindPhysicalFileByOid(dbDir string, tableOid int) string {
 	pgClassPath := SysFilePath(dbDir, pgClassOID)
 	if pgClassPath == "" {
 		return ""
 	}
-	found := 0
+	var foundRfn, foundTbs int
 	iterateTuples(pgClassPath, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
 		row := classFields(t)
 		if row != nil && row.oid == tableOid {
-			found = row.relfilenode
+			foundRfn = row.relfilenode
+			foundTbs = row.reltablespace
 			return false
 		}
 		return true
 	})
-	if found == 0 {
+	if foundRfn == 0 {
 		return ""
 	}
-	p := filepath.Join(dbDir, strconv.Itoa(found))
+	// 表空间感知定位（reltablespace=0 时等价旧行为 <dbDir>/<rfn>）
+	if p := resolveTablespaceFile(dbDir, foundTbs, foundRfn); p != "" {
+		return p
+	}
+	// 兜底回退旧行为（兼容符号链接/版本目录未按预期布局的场景）
+	p := filepath.Join(dbDir, strconv.Itoa(foundRfn))
 	if _, err := os.Stat(p); err == nil {
 		return p
 	}
@@ -966,6 +1080,15 @@ func FindTableMetaByName(dbDir, name string) (*meta.TableMeta, string, error) {
 		})
 	}
 	if len(matches) == 0 {
+		// v0.2.18：pg_class 零命中时回查 pg_partition 子分区（openGauss 传统分区的子分区不在 pg_class）。
+		// pg_class 命中（普通表/父表）时完全走原逻辑；只有零命中才进此兜底。
+		res, err := lookupChildPartition(abs, pgClassPath, nsMap, attByRel, relname, schema)
+		if err != nil {
+			return nil, "", err
+		}
+		if res != nil {
+			return res.tm, res.fp, nil
+		}
 		return nil, "", fmt.Errorf("未找到表 %q（检查 schema.table 或数据库目录是否正确）", name)
 	}
 	if schema == "" && len(matches) > 1 {
@@ -989,19 +1112,24 @@ func FindTableMetaByName(dbDir, name string) (*meta.TableMeta, string, error) {
 		return nil, "", fmt.Errorf("表 %s.%s 无列定义（pg_attribute 解析失败）", ns, row.relname)
 	}
 	tm := &meta.TableMeta{
-		DBName:      filepath.Base(abs),
-		Schema:      ns,
-		Relname:     row.relname,
-		Relfilenode: row.relfilenode,
-		Reloid:      row.oid,
-		Columns:     cols,
-		Relkind:     row.relkind,
-		Toastrelid:  row.toastrelid,
-		TypeNames:   BuildTypeNameMap(abs),
+		DBName:        filepath.Base(abs),
+		Schema:        ns,
+		Relname:       row.relname,
+		Relfilenode:   row.relfilenode,
+		Reloid:        row.oid,
+		Reltablespace: row.reltablespace,
+		Columns:       cols,
+		Relkind:       row.relkind,
+		Toastrelid:    row.toastrelid,
+		TypeNames:     BuildTypeNameMap(abs),
 	}
 	filePath := ""
 	if row.relfilenode != 0 {
 		filePath = FindPhysicalFileByOid(abs, row.oid)
+		if filePath == "" {
+			// 兜底：直接按表空间感知规则解析（reltablespace=0 时即 <dbDir>/<rfn>）
+			filePath = resolveTablespaceFile(abs, row.reltablespace, row.relfilenode)
+		}
 		if filePath == "" {
 			filePath = filepath.Join(abs, strconv.Itoa(row.relfilenode))
 		}
@@ -1011,16 +1139,168 @@ func FindTableMetaByName(dbDir, name string) (*meta.TableMeta, string, error) {
 	}
 	if filePath == "" {
 		// 分区父表判定：pg_partition 中存在 parentid=本表 oid 的子分区
-		if parts := ListPartitionFiles(abs, row.oid); len(parts) > 0 {
+		if parts := ListPartitionFiles(abs, row.oid, row.reltablespace); len(parts) > 0 {
 			tm.Relfilenode = 0 // 父表无独立物理文件，由调用方展开子分区
 		}
 	}
 	return tm, filePath, nil
 }
 
+// childResult 子分区兜底定位结果（v0.2.18）
+type childResult struct {
+	tm *meta.TableMeta
+	fp string
+}
+
+// lookupChildPartition 在 pg_class 未命中时，按子分区 relname 回查 pg_partition（v0.2.18）。
+//
+// openGauss 传统分区（PARTITION BY RANGE/LIST/HASH）的子分区元数据只存在于 pg_partition，
+// 不在 pg_class，因此 --table-name <子分区名> 此前报"未找到表"。此函数：
+//  1. 扫 pg_partition，按 relname==入参 relname 且 rfn>0 收集子分区 (parentid, rfn)；
+//  2. parentid 回 pg_class 取父表行 → schema(ns)、reltablespace、toastrelid、列定义 attByRel[parentid]；
+//  3. 命中后构造 tm：Relname=子分区名、Relfilenode=子分区 rfn(>0)、Relkind="r"，
+//     这样调用方 exportOneTableByName 走普通表 streamKnownTable 分支（不进父表展开）；
+//  4. 消歧：pg_class 普通表优先（本函数仅在 pg_class 零命中时被调用）；裸名跨多个父 schema 命中时报错。
+//
+// 返回 (nil, nil) = pg_partition 也未命中（由调用方维持原"未找到表"报错）；
+// 返回 (res, nil) = 成功命中；返回 (nil, err) = 歧义/列定义缺失等需向用户报告的错误。
+func lookupChildPartition(abs, pgClassPath string, nsMap map[int]string, attByRel map[int][]*meta.Column, relname, schema string) (*childResult, error) {
+	partPath := partitionFilePath(abs)
+	if partPath == "" {
+		return nil, nil
+	}
+	type child struct {
+		parentid int
+		rfn      int
+		tblspc   int // 子分区自己的 reltablespace（v0.2.19）
+	}
+	var children []*child
+	iterateTuples(partPath, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
+		cr, _, pid, rfn, tspc := partitionFields(t)
+		if cr == relname && pid != 0 && rfn != 0 {
+			children = append(children, &child{parentid: pid, rfn: rfn, tblspc: tspc})
+		}
+		return true
+	})
+	if len(children) == 0 {
+		return nil, nil
+	}
+	// 按 parentid 缓存父表 pg_class 行（同一父表可能含多个同名子分区？一般不会，仍缓存避免重复全扫）
+	parentRow := map[int]*classRow{}
+	iterateTuples(pgClassPath, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
+		if row := classFields(t); row != nil {
+			parentRow[row.oid] = row
+		}
+		return true
+	})
+	type cand struct {
+		row *classRow
+		c   *child
+		ns  string
+	}
+	var cands []*cand
+	seen := map[string]bool{}
+	for _, c := range children {
+		row := parentRow[c.parentid]
+		if row == nil {
+			continue
+		}
+		ns := nsMap[row.relns]
+		if ns == "" {
+			ns = "public"
+		}
+		if schema != "" && ns != schema {
+			continue
+		}
+		key := ns + "#" + strconv.Itoa(c.parentid) + "#" + strconv.Itoa(c.rfn)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		cands = append(cands, &cand{row: row, c: c, ns: ns})
+	}
+	if len(cands) == 0 {
+		return nil, nil
+	}
+	// 裸名（未指定 schema）跨多个父 schema 命中时报歧义，提示用 schema.table
+	if schema == "" {
+		nsSet := map[string]bool{}
+		var names []string
+		for _, cd := range cands {
+			full := cd.ns + "." + relname
+			if !nsSet[full] {
+				nsSet[full] = true
+				names = append(names, full)
+			}
+		}
+		if len(names) > 1 {
+			return nil, fmt.Errorf("子分区 %q 在多个 schema 下存在: %s，请用 schema.table 指定", relname, strings.Join(names, ", "))
+		}
+	}
+	cd := cands[0]
+	cols := attByRel[cd.row.oid]
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("子分区 %s.%s 无列定义（pg_attribute 解析失败）", cd.ns, relname)
+	}
+	// v0.2.19：子分区用自己的 reltablespace（pg_partition.reltablespace）；
+	// 为 0（继承/默认）时回退父表 pg_class.reltablespace。旧版误用父表表空间，
+	// 导致独立表空间子分区（如父 ts1 + 子 ts3）定位到错误表空间目录。
+	childTbsp := cd.c.tblspc
+	if childTbsp == 0 {
+		childTbsp = cd.row.reltablespace
+	}
+	tm := &meta.TableMeta{
+		DBName:        filepath.Base(abs),
+		Schema:        cd.ns,
+		Relname:       relname, // 子分区自己的名字（pg_partition.relname）
+		Relfilenode:   cd.c.rfn, // 子分区物理文件节点（>0 → 调用方走普通表分支）
+		Reloid:        cd.row.oid, // 列默认值/约束/注释挂在父表上
+		Reltablespace: childTbsp,
+		Columns:       cols,
+		Relkind:       "r", // 让 exportOneTableByName 走 streamKnownTable，不进父表展开
+		Toastrelid:    cd.row.toastrelid,
+		TypeNames:     BuildTypeNameMap(abs),
+	}
+	// 表空间感知定位子分区物理文件（先子分区表空间，0 已回退父表）
+	fp := ResolvePhysicalFile(abs, childTbsp, cd.c.rfn)
+	if fp == "" {
+		fp = filepath.Join(abs, strconv.Itoa(cd.c.rfn))
+	}
+	if _, err := os.Stat(fp); err != nil {
+		fp = ""
+	}
+	return &childResult{tm: tm, fp: fp}, nil
+}
+
+// PartitionParentOids 返回所有拥有子分区（rfn>0）的父表 OID 集合（v0.2.18）。
+// openGauss 传统分区父表在 pg_class 中 relkind='r'（不是 PostgreSQL 的 'p'），
+// 仅靠 relkind 无法识别；需经 pg_partition 的 parentid→子分区关系判定，供批量导出展开父表用。
+func PartitionParentOids(dbDir string) map[int]bool {
+	abs, _ := filepath.Abs(dbDir)
+	out := map[int]bool{}
+	partPath := partitionFilePath(abs)
+	if partPath == "" {
+		return out
+	}
+	iterateTuples(partPath, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
+		_, _, parentid, rfn, _ := partitionFields(t)
+		if parentid != 0 && rfn != 0 {
+			out[parentid] = true
+		}
+		return true
+	})
+	return out
+}
+
 // ListPartitionFiles 列出分区父表（parentOid）的全部子分区物理数据文件（v0.2.12）。
 // openGauss 分区父表 relfilenode=0，子分区元数据在 pg_partition（parentid→父表 OID）。
-func ListPartitionFiles(dbDir string, parentOid int) []string {
+//
+// v0.2.19：表空间感知修复。旧版误用 FindPhysicalFileByOid(abs, rfn)（把 rfn 当 oid 查
+// pg_class 永远为空）+ filepath.Join(abs, rfn) 只在 base/<dbOid>/ 兜底，独立表空间子分区
+// 全部漏定位。现改为：对每个子分区取其 pg_partition.reltablespace，为 0 时回退父表
+// parentTbsp，再 ResolvePhysicalFile(abs, effectiveTbsp, rfn)。找不到文件的子分区向
+// stderr 告警后跳过（不静默、不 panic）。
+func ListPartitionFiles(dbDir string, parentOid int, parentTbsp int) []string {
 	abs, _ := filepath.Abs(dbDir)
 	partPath := partitionFilePath(abs)
 	var files []string
@@ -1028,16 +1308,22 @@ func ListPartitionFiles(dbDir string, parentOid int) []string {
 		return files
 	}
 	iterateTuples(partPath, 0, func(pno, idx int, t *tuple.HeapTuple) bool {
-		relname, _, parentid, rfn := partitionFields(t)
+		relname, _, parentid, rfn, childTbsp := partitionFields(t)
 		if relname == "" || parentid != parentOid || rfn == 0 {
 			return true
 		}
-		p := FindPhysicalFileByOid(abs, rfn)
+		effectiveTbsp := childTbsp
+		if effectiveTbsp == 0 {
+			effectiveTbsp = parentTbsp
+		}
+		p := ResolvePhysicalFile(abs, effectiveTbsp, rfn)
 		if p == "" {
 			p = filepath.Join(abs, strconv.Itoa(rfn))
 		}
 		if _, err := os.Stat(p); err == nil {
 			files = append(files, p)
+		} else {
+			fmt.Fprintf(os.Stderr, "warning: 子分区 %s (relfilenode=%d, reltablespace=%d) 数据文件未找到，已跳过\n", relname, rfn, effectiveTbsp)
 		}
 		return true
 	})
@@ -1134,7 +1420,7 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) map[string]*meta.TableMet
 		}
 		tm := &meta.TableMeta{
 			DBName: filepath.Base(abs), Schema: schema, Relname: relname,
-			Relfilenode: rfn, Columns: cols, Relkind: relkind,
+			Relfilenode: rfn, Reltablespace: row.reltablespace, Columns: cols, Relkind: relkind,
 			TypeNames: BuildTypeNameMap(abs),
 		}
 		out[tm.FullName()] = tm
@@ -1148,38 +1434,38 @@ func AutoDiscoverAllTables(dbDir string, pageSize int) map[string]*meta.TableMet
 
 // ExportMetaTable 导出 JSON 用表
 type ExportMetaTable struct {
-	Schema      string            `json:"schema"`
-	Table       string            `json:"table"`
-	Oid         int               `json:"oid"`
-	Relkind     string            `json:"relkind"`
-	Relfilenode int               `json:"relfilenode"`
-	Toastrelid  int               `json:"toastrelid"`
-	PrimaryKey  []string          `json:"primary_key"`
-	TypeNames   map[int]string    `json:"type_names"`
-	Columns     []ExportCol       `json:"columns"`
+	Schema      string         `json:"schema"`
+	Table       string         `json:"table"`
+	Oid         int            `json:"oid"`
+	Relkind     string         `json:"relkind"`
+	Relfilenode int            `json:"relfilenode"`
+	Toastrelid  int            `json:"toastrelid"`
+	PrimaryKey  []string       `json:"primary_key"`
+	TypeNames   map[int]string `json:"type_names"`
+	Columns     []ExportCol    `json:"columns"`
 }
 
 // ExportCol 导出 JSON 列
 type ExportCol struct {
-	Name      string `json:"name"`
-	TypeOid   int    `json:"type_oid"`
-	Len       int    `json:"len"`
-	Attnum    int    `json:"attnum"`
-	Typmod    int    `json:"typmod"`
-	Notnull   bool   `json:"notnull"`
-	Dropped   bool   `json:"dropped"`
-	Attalign  string `json:"attalign"`
-	Attbyval  bool   `json:"attbyval"`
+	Name       string `json:"name"`
+	TypeOid    int    `json:"type_oid"`
+	Len        int    `json:"len"`
+	Attnum     int    `json:"attnum"`
+	Typmod     int    `json:"typmod"`
+	Notnull    bool   `json:"notnull"`
+	Dropped    bool   `json:"dropped"`
+	Attalign   string `json:"attalign"`
+	Attbyval   bool   `json:"attbyval"`
 	Attstorage string `json:"attstorage"`
 }
 
 // ExportMetaJSON export-meta 输出
 type ExportMetaJSON struct {
-	Database   string             `json:"database"`
-	PgVersion  int                `json:"pg_version"`
+	Database   string                 `json:"database"`
+	PgVersion  int                    `json:"pg_version"`
 	Enums      map[int]map[int]string `json:"enums"`       // 枚举成员映射（数据解码用）
-	EnumLabels map[int][]string   `json:"enum_labels"`     // 枚举有序标签（DDL 重建用）
-	Tables     []ExportMetaTable  `json:"tables"`
+	EnumLabels map[int][]string       `json:"enum_labels"` // 枚举有序标签（DDL 重建用）
+	Tables     []ExportMetaTable      `json:"tables"`
 }
 
 // AutoDiscoverAllTablesOrdered 按 pg_class 插入顺序返回去重后的表列表
@@ -1236,7 +1522,8 @@ func AutoDiscoverAllTablesOrdered(dbDir string, pageSize int) []*meta.TableMeta 
 		}
 		tm := &meta.TableMeta{
 			DBName: filepath.Base(abs), Schema: schema, Relname: row.relname,
-			Relfilenode: row.relfilenode, Reloid: row.oid, Columns: cols, Relkind: row.relkind,
+			Relfilenode: row.relfilenode, Reloid: row.oid, Reltablespace: row.reltablespace,
+			Columns: cols, Relkind: row.relkind,
 			Toastrelid: row.toastrelid,
 			TypeNames:  BuildTypeNameMap(abs),
 		}
@@ -1322,7 +1609,7 @@ func MarshalIndent(v interface{}) ([]byte, error) {
 	return []byte(s), nil
 }
 
-// ---- pg_index 宽松解析（v0.2.6，移植自 pg2sql-go varlena 定位法，兼容不同布局）----
+// ---- pg_index 宽松解析（v0.2.6，varlena 定位法，兼容不同布局）----
 // IndexRow pg_index 行关键字段
 type IndexRow struct {
 	IndexRelID int
@@ -1353,7 +1640,7 @@ func locateIndkey(raw []byte, hoff int) int {
 }
 
 // indexFields 解析 pg_index 行：indexrelid@0 indrelid@4 indisunique@10 indisprimary@11
-//（openGauss 列序与 PG 不同，经 pg_class 实测校准），indkey 用 varlena 定位。
+// （openGauss 列序与 PG 不同，经 pg_class 实测校准），indkey 用 varlena 定位。
 func indexFields(t *tuple.HeapTuple) *IndexRow {
 	raw := t.Raw
 	hoff := int(t.HOff)
@@ -1404,7 +1691,7 @@ func loadBackingIndexOids(dbDir string, reloid, pageSize int) map[int]bool {
 
 // LoadIndexes 返回目标表（reloid）的非主键索引（含唯一索引）；表达式/部分索引跳过。
 // v0.2.7：除 indisprimary 外，额外跳过被 contype in ('p','u') 约束 conindid 引用的 backing 索引
-//（PK/UNIQUE 约束已内联进 CREATE TABLE，其同名隐式索引不再重复 emit 独立 CREATE INDEX）。
+// （PK/UNIQUE 约束已内联进 CREATE TABLE，其同名隐式索引不再重复 emit 独立 CREATE INDEX）。
 func LoadIndexes(dbDir string, reloid int, pageSize int) []IndexInfo {
 	var out []IndexInfo
 	if reloid == 0 {

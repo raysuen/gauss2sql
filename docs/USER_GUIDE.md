@@ -1,6 +1,6 @@
 # gauss2sql 用户手册
 
-> gauss2sql-go v0.2.12（Author: raysuen）
+> gauss2sql-go v0.2.20（Author: raysuen）
 > openGauss 离线导出工具：直接读取数据目录堆文件，导出 SQL / CSV / DDL / 元数据 JSON
 
 ---
@@ -105,12 +105,13 @@ openGauss 堆数据文件路径或数据库目录。
 |---|---|---|
 | 单个数据文件 | `base/16388/16414` | 单表导出（自动发现表结构） |
 | 数据库目录 | `base/16388` | 配合 `--table-name` / `--list-tables-db` / `--list-tables-all` / `--export-meta` / `--tables` / `--all-tables` / `--schema` |
-| 数据根目录 | `/data/openGauss` | 配合 `--datadir` + `--list-db` |
+| 数据根目录 | `/data/openGauss` | 配合 `--datadir` + `--list-db`；或 `--datadir` + `--db-id OID` 直接定位单库导出 |
 
 **路径结构说明**（openGauss 数据目录）：
 - `base/<数据库OID>/`：每个数据库一个目录，内含系统目录文件与用户表文件
 - 文件名 = relfilenode，普通表/索引/序列/TOAST 各有自己的文件
 - `pg_database` 在 `global/` 下，`--list-db` 通过它列出全部数据库
+- `pg_tblspc/<表空间OID>/`：独立表空间符号链接（v0.2.16 起自动解析），其下 `PG_*/<dbOID>/<relfilenode>` 是落在独立表空间里的表/TOAST 文件
 
 ### 4.2 通用选项
 
@@ -118,7 +119,8 @@ openGauss 堆数据文件路径或数据库目录。
 |---|---|
 | `-h, --help` | 显示帮助信息并退出 |
 | `--version` | 显示版本号并退出 |
-| `--datadir DIR` | openGauss 数据目录（配合 `--list-db` 使用，如 `/data/openGauss`） |
+| `--datadir DIR` | openGauss 数据目录（配合 `--list-db` 使用，如 `/data/openGauss`；v0.2.16 起亦可配合 `--db-id` 直接定位单库导出） |
+| `--db-id OID` | 数据库 OID（v0.2.16）。与 `--datadir` 组合时 `dbDir=<datadir>/base/<OID>`，驱动 `--list-tables-db`/`--table-name`/`--schema`/`--tables`；与位置参数并存、向后兼容 |
 | `--verbose` | 打印导出过程信息（表结构/TOAST/输出路径/行数/耗时，输出到 **stderr**，不影响数据输出） |
 
 **--verbose 示例**：
@@ -183,20 +185,24 @@ openGauss 堆数据文件路径或数据库目录。
 
 | 参数 | 说明 |
 |---|---|
-| `--list-db` | 列出数据目录中的全部数据库（OID + 名称 + 目录路径）。需 `--datadir` 或位置参数 |
-| `--list-tables-db` | 列出指定数据库目录的**用户对象**（普通表/索引/序列/TOAST/视图，默认过滤系统 schema） |
+| `--list-db` | 列出数据目录中的全部数据库（OID + 名称 + 目录路径；v0.2.16 起多行追加该库在独立表空间下的目录路径）。需 `--datadir` 或位置参数 |
+| `--list-tables-db` | 列出指定数据库目录的**用户对象**（普通表/索引/序列/TOAST/视图，默认过滤系统 schema；v0.2.16 起含独立表空间里的表，正向遍历 pg_class 并经 pg_tblspc 解析真实路径） |
 | `--list-tables-all` | 列出全部对象（**含系统 schema**） |
 | `--export-meta` | 导出全部表结构为元数据 JSON（供 `--catalog-json` 使用） |
 
 **示例**：
 ```bash
 ./gauss2sql --datadir /data/openGauss --list-db
+./gauss2sql --datadir /data/openGauss --db-id 16385 --list-tables-db
+./gauss2sql --datadir /data/openGauss --db-id 16385 --table-name app.t_in_tbs1 --sql
 ./gauss2sql base/16388 --list-tables-db
 ./gauss2sql base/16388 --list-tables-all
 ./gauss2sql base/16388 --export-meta -o /tmp/meta.json
 ```
 
-### 4.6 批量导出参数（对齐 pg2sql）
+> **独立表空间（v0.2.16）**：建在 `CREATE TABLESPACE` 上的表，其堆/TOAST 文件不在 `base/<dbOid>/` 而在 `pg_tblspc/<tbsOID>/PG_*/<dbOid>/`。工具自动经符号链接解析，无需手动定位。已知限制：分区/子分区表空间本期不解析（`pg_partition` 无 reltablespace）。
+
+### 4.6 批量导出参数
 
 | 参数 | 说明 |
 |---|---|
@@ -227,7 +233,10 @@ openGauss 堆数据文件路径或数据库目录。
 | 参数 | 说明 |
 |---|---|
 | `-o, --output PATH` | 输出到文件或目录（规则见第 6 节）；未指定时输出到标准输出 |
-| `--parallel N` | 并行导出线程数（默认 1）。输出与串行**逐字节一致** |
+| `--parallel N` | 单表内部页级并行导出线程数（默认 1=串行）。输出与串行**逐字节一致** |
+| `--jobs M` | 批量导出表间并行 worker 数（v0.2.20，默认 1=串行关闭；与 `--parallel` 正交叠乘，见 5.10） |
+| `--batch-rows N` | 多值 INSERT：每 N 行合并为一条 INSERT（v0.2.20，默认 0=关闭，即每行一条、与旧版逐字节一致，见 4.8） |
+| `--report PATH` | 导出结束写每表统计 JSON（v0.2.20，默认不写，见 4.8） |
 | `--limit N` | 只导出前 N 行 |
 | `--delimiter STR` | CSV 字段分隔符（默认 `,`，与 COPY DELIMITER 语义一致） |
 | `--fields COL1,COL2` | 只导出指定字段（逗号分隔；不存在的字段会报错） |
@@ -248,6 +257,64 @@ openGauss 堆数据文件路径或数据库目录。
 # 4 线程并行
 ./gauss2sql base/16388/16414 --sql --parallel 4
 ```
+
+### 4.8 v0.2.20 新增：批量导出增强参数（均默认关闭）
+
+以下四项为 v0.2.20 新增能力，**全部默认关闭**；未显式开启时输出与旧版逐字节一致。
+
+**`--batch-rows N`（多值 INSERT，默认 N=0 关闭）**
+
+默认（N=0）每行一条 `INSERT INTO ... VALUES (...);`，与旧版逐字节一致。指定 N 后，每 N 行合并为一条多值 INSERT（列名只写一次）：
+
+```sql
+INSERT INTO app.users (id, name) VALUES
+  (1, 'alice'),
+  (2, 'bob'),
+  (3, 'carol');
+```
+
+示例：
+
+```bash
+./gauss2sql base/16388 --tables --sql --batch-rows 500 -o /tmp/out/
+```
+
+流式攒满 N 行即落盘，几乎不额外耗内存；但可把导出 SQL 文件的 INSERT 语句条数从"行数"降到"行数 ÷ N"，显著减少 gsql 导入时的语句解析开销。
+
+**`--jobs M`（表间并行，默认 M=1 关闭）**
+
+批量导出时同时处理的表数（外层 worker）。默认 M=1 串行逐表导出；与 `--parallel N`（单表内部页级并行，内层）**正交、可叠乘**：
+
+```bash
+# 4 张表同时导出，每张表内部 2 路页级并行
+./gauss2sql base/16388 --tables --sql -o /tmp/out/ --jobs 4 --parallel 2
+```
+
+并发 worker 总数 ≈ jobs × parallel，建议不超过 CPU 物理核数 × 2。内存与 CPU 占用估算见 5.10。
+
+**`--report PATH`（每表统计 JSON，默认不写）**
+
+导出结束后在 PATH 写一份统计 JSON，结构为 `{version, database, tables[]}`，每个 table 条目含：
+
+| 字段 | 含义 |
+|---|---|
+| `schema` / `name` | 表 schema 与表名 |
+| `oid` | 表 OID |
+| `rows` | 导出行数 |
+| `bytes` | 导出字节数 |
+| `sha256` | 该表导出内容的 SHA-256 |
+| `duration_ms` | 导出耗时（毫秒） |
+| `corrupt_pages` | 坏页数 |
+
+```bash
+./gauss2sql base/16388 --tables --sql -o /tmp/out/ --report /tmp/out/report.json
+```
+
+SHA-256 仅每表计算一次，开销可忽略；可用于导出后校验与跨次导出对比。
+
+**自动生成 `import.sh`（无需参数，批量导出结束后自动生成）**
+
+批量导出（`--tables`/`--all-tables`/`--schema`）结束后，自动在 `-o` 目录生成 `import.sh`：按表名排序的 gsql 调用序列，DDL 先于数据 SQL，文件头部带目标库变量注释（如 `# 目标库: targetdb`）。脚本经 `bash -n` 语法校验通过，修改目标库变量后可直接 `bash import.sh` 一键导入。
 
 ---
 
@@ -333,6 +400,48 @@ gsql -d targetdb -c "COPY app.users FROM '/tmp/users.csv' WITH (FORMAT csv, HEAD
 ./gauss2sql /data/openGauss/base/16388 --list-tables-db
 ./gauss2sql /data/openGauss/base/16388 --tables --sql -o /tmp/rescue/
 ```
+
+### 5.10 场景：--jobs 与 --parallel 资源占用估算
+
+批量导出支持两层正交并行：`--parallel N` 是**单表内部**页级并行（内层），`--jobs M` 是**表间**并行 worker 数（外层），二者可叠乘。
+
+**内存估算公式**：
+
+```
+总内存 ≈ 共享系统目录缓存（约 15MB）+ jobs × 单表流式峰值
+```
+
+单表流式峰值随 `--parallel` 增大而上升（每多一个内层 worker 就多一份页级解析/转义缓冲）。
+
+**实测锚点**（openGauss 6.0.6、180 万行 1.47GB 表）：单表串行（parallel=1）约 **28MB**；单表 `--parallel 4` 约 **140MB**。据此线性插值单表峰值：parallel=1 → 28MB、parallel=2 → 约 65MB、parallel=4 → 140MB。
+
+**估算峰值内存表（单位 MB，标注为"估算值"）**：
+
+| jobs \ parallel | parallel=1 | parallel=2 | parallel=4 |
+|---|---|---|---|
+| jobs=1 | ≈43 | ≈80 | ≈155 |
+| jobs=4 | ≈127 | ≈275 | ≈575 |
+| jobs=8 | ≈239 | ≈535 | ≈1135 |
+| jobs=16 | ≈463 | ≈1055 | ≈2255 |
+
+单元格 = 15MB 共享系统目录缓存 + jobs × 单表峰值。
+
+> 实际占用受表宽、TOAST、坏页、并发 IO 影响，此表为**规划容量用估算**；大批量导出建议后台执行并观察 RSS。
+
+**CPU 公式**：
+
+```
+并发 worker 总数 ≈ jobs × parallel
+```
+
+建议不超过 CPU 物理核数 × 2；超过会因上下文切换和磁盘 IO 争抢反而变慢。
+
+**推荐配置**：
+
+- **3GB 内存沙箱/容器**：`jobs=4`、`parallel=2`（峰值约 275MB，留余量）
+- **8GB 生产环境**：`jobs=8`、`parallel=4`（峰值约 1.1GB）
+
+**其他新参数的开销**：`--batch-rows N` 几乎不额外耗内存（流式攒满 N 行即落盘），但会显著减少导出 SQL 文件的 INSERT 语句条数；`--report PATH` 仅为每表额外做一次 SHA-256，开销可忽略。
 
 ---
 
