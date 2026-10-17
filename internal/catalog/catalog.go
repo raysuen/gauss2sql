@@ -540,15 +540,19 @@ func decodeInt2Array(raw []byte) []int {
 }
 
 // varlenaText 从 ExtractFieldsDirect 返回的整段 varlena（含头）中取出文本负载。
+// v0.2.21: 剥头后必须走 binary.DecodeBytes（全局 codec）解码——
+// pg_attrdef.adsrc / pg_description.description / pg_constraint.conbin(src)
+// 等中文 DDL 片段在 GBK/GB18030 库上是按库编码存储的字节，raw string() 强转
+// 会被当作 UTF-8 解读产生乱码。UTF-8 库上 DecodeBytes 对合法 UTF-8 直通，逐字节等价。
 func varlenaText(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
 	kind, _, poff, plen := binary.VarlenaParse(b, 0)
 	if kind == "" || poff+plen > len(b) {
-		return string(b)
+		return binary.DecodeBytes(b)
 	}
-	return string(b[poff : poff+plen])
+	return binary.DecodeBytes(b[poff : poff+plen])
 }
 
 // LoadAttrDefaults 读 pg_attrdef：reloid → {attnum: adsrc}

@@ -653,6 +653,8 @@ func jsonbScalarToText(je uint32, payload []byte, dataOff, s, e int) string {
 	t := je & jTypeMask
 	switch t {
 	case 0:
+		// v0.2.21: jsonb 容器内字符串 leaf 按库编码存储（GBK 库上实测为 GBK 字节，
+		// 非 UTF-8），必须走全局 codec 转码（与普通 text 列一致）；UTF-8 库直通。
 		return jsonQuote(binary.DecodeBytes(payload[dataOff+s : dataOff+e]))
 	case jTypeNum:
 		off := (s + 3) &^ 3

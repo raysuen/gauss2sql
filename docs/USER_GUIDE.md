@@ -374,7 +374,34 @@ gsql -d targetdb -c "COPY app.users FROM '/tmp/users.csv' WITH (FORMAT csv, HEAD
 
 # 强制指定（探测失败时）
 ./gauss2sql base/16388/16414 --sql --encoding GBK
+
+# GB18030 扩展字（㐀㑭㠇 等）
+./gauss2sql base/16388/16422 --sql --encoding GB18030
 ```
+
+**输出约定**：无论源端编码是 GBK / GB18030 / LATIN1，导出的 `.sql` / `.csv` 一律为 **UTF-8**。批量导出（`--all-tables` / `--tables` / `--schema`）自动生成的 `import.sh` 在每个 `gsql -f` 前会先执行 `\encoding UTF8`（v0.2.21 起），可直接把 UTF-8 文本载入目标库。
+
+**v0.2.21 实测验证矩阵**（openGauss 5.0.0 / 6.0.5 / 6.0.6 三版本，2026-10-15 ~ 10-16）：
+
+| 源编码 | 版本 | 数据目录 | 表（relfilenode） | 结果 |
+|--------|------|----------|-------------------|------|
+| GBK | 6.0.5 | `_og/data_gbk/base/16385` | t_base(16387) | utf8.Valid ✅ 中文 ✅ |
+| GBK | 6.0.5 | 同上 | "中文表"(16393) | utf8.Valid ✅ 中文标识符 ✅ |
+| GBK | 6.0.5 | 同上 | t_jsonb(16401) | utf8.Valid ✅ 中文 leaf 正确（修复前 `±¸×¢` 乱码） |
+| GBK | 6.0.5 | 同上 | t_toast(16407) | utf8.Valid ✅ 6000/10000 字大字段 ✅ |
+| GBK | 6.0.5 | 同上 | t_bpchar(16413) | utf8.Valid ✅ char(20) 尾随空格 ✅ |
+| GBK | 6.0.5 | 同上 | t_null(16416) | utf8.Valid ✅ 空串 vs NULL ✅ |
+| GB18030 | 6.0.5 | `_og/data_gb18030/base/16385` | t_ext(16422) | utf8.Valid ✅ 扩展字 㐀㑭㠇 round-trip ✅ |
+| GBK | 5.0.0 | `_og/data_gbk_500/base/16385` | 全矩阵 6 表 | utf8.Valid ✅ INSERT 数据行与 6.0.5 逐字节一致 |
+| GB18030 | 5.0.0 | `_og/data_gb18030_500/base/16385` | + t_ext(16422) | utf8.Valid ✅ 扩展字正确 |
+| GBK | 6.0.6 | `_og/data_gbk_606/base/16404` | 全矩阵 6 表 | utf8.Valid ✅ 无列序/页布局差异 |
+| GB18030 | 6.0.6 | `_og/data_gb18030_606/base/16436` | + t_ext(16480) | utf8.Valid ✅ 扩展字正确 |
+
+**三版本结论**：GBK/GB18030 端到端在 5.0.0 → 6.0.5 → 6.0.6 跨大版本全部通过；5.0.0 与 6.0.5 导出 INSERT 数据行逐字节一致，6.0.6 未发现系统目录列序/页布局差异。已知非导出器差异：5.0.0 `pg_class` 无 `reltableid` 列（6.x 新增）；6.0.6 启动需 oe24rootfs wrapper（glibc 2.38）；灌库须 `PGCLIENTENCODING=UTF8`。
+
+**round-trip 比对注意**：jsonb 内部按键字节排序，GBK（zh_CN.gbk collation）与 UTF8（en_US.utf8 collation）中文键顺序不同。判定 jsonb 内容一致须用**顺序无关的键值对集合**（`jsonb_each_text` 提取 + `LC_ALL=C sort`），不要直接 diff `doc::text`。
+
+**导入非 UTF8 目标库**：导出文件是 UTF-8，目标库为 GBK/GB18030 时须 `PGCLIENTENCODING=UTF8`（或依赖 `import.sh` 内嵌的 `\encoding UTF8`），否则报 `invalid byte sequence for encoding "GBK"`。
 
 ### 5.7 场景：元数据 JSON 闭环（catalog-json）
 
@@ -546,7 +573,7 @@ gsql -d targetdb -c "COPY app.users FROM '/tmp/users.csv' WITH (FORMAT csv, HEAD
 用 `schema.table` 精确指定，如 `app.users`。
 
 **Q3：CSV 导出的中文乱码？**
-自动探测失败时用 `--encoding GBK`（或 GB18030/UTF8）强制指定；输出统一为 UTF-8。
+自动探测失败时用 `--encoding GBK`（或 GB18030/UTF8）强制指定；输出统一为 UTF-8。v0.2.21 起 jsonb 字符串 leaf 与中文 DDL 片段（列默认值/表注释/CHECK 表达式）也走同一 codec，GBK/GB18030 库上不再出现 `±¸×¢` 类 latin-1 兜底乱码；详见 §5.6 实测矩阵。
 
 **Q4：批量导出提示必须指定 -o？**
 批量模式（`--tables`/`--all-tables`/`--schema`）必须 `-o` 已存在目录 + `--sql`/`--data`/`--ddl` 之一。

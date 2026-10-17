@@ -158,5 +158,54 @@ DELETE FROM app.t_simple WHERE id IN (5, 10, 15, 20, 25);
 -- 更新一些行（旧版本留 t_xmax）
 UPDATE app.t_simple SET name = 'updated-' || id WHERE id IN (30, 31, 32);
 
--- 9. CHECKPOINT 强制落盘
+-- 9. 大表 big50: 10 列 x 5000 行，用于 --batch-rows / --jobs / 坏块 / 导入比对
+DROP TABLE IF EXISTS app.big50 CASCADE;
+CREATE TABLE app.big50 (
+  id    int4,
+  c1    int4,
+  c2    int8,
+  c3    numeric(12,2),
+  c4    text,
+  c5    varchar(100),
+  c6    bool,
+  c7    timestamp,
+  c8    float8,
+  c9    bytea
+);
+INSERT INTO app.big50
+SELECT g, g, g*1000::int8, (g*1.15)::numeric(12,2),
+       'big-row-' || g, 'varchar-' || g, (g%2=0),
+       '2024-01-01 00:00:00'::timestamp + (g || ' seconds')::interval,
+       g*0.5, decode(repeat('ab', 8), 'hex')
+FROM generate_series(1, 5000) g;
+
+-- 10. 独立表空间对象（目录 /tmp/ts_test 由 shell 预先 mkdir）
+-- 容错：若该版本不支持/权限失败，CREATE 会报错，但不影响其它造数
+DROP TABLE IF EXISTS app.ts_t1 CASCADE;
+DROP TABLE IF EXISTS app.ts_part CASCADE;
+DROP TABLESPACE IF EXISTS ts_test;
+
+-- 忽略建表空间失败（老版本可能路径权限不同）
+\set ON_ERROR_STOP off
+CREATE TABLESPACE ts_test LOCATION '/tmp/ts_test';
+\set ON_ERROR_STOP on
+
+-- ts_t1 普通表放独立表空间
+CREATE TABLE app.ts_t1 (
+  id int4,
+  val text
+) TABLESPACE ts_test;
+INSERT INTO app.ts_t1 SELECT g, 'ts_t1-row-' || g FROM generate_series(1, 120) g;
+
+-- ts_part 分区表：tp1 放 ts_test，tp2 放默认表空间（用唯一名避免与 t_part 的 p1 冲突）
+CREATE TABLE app.ts_part (
+  id int4,
+  val text
+) PARTITION BY RANGE (id) (
+  PARTITION tp1 VALUES LESS THAN (150) TABLESPACE ts_test,
+  PARTITION tp2 VALUES LESS THAN (300)
+);
+INSERT INTO app.ts_part SELECT g, 'ts_part-' || g FROM generate_series(1, 299) g;
+
+-- 11. CHECKPOINT 强制落盘
 CHECKPOINT;

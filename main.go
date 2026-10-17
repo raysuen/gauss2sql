@@ -27,7 +27,7 @@ import (
 	"gauss2sql-go/internal/types"
 )
 
-var version = "0.2.20"
+var version = "0.2.21"
 
 type options struct {
 	dataPath      string
@@ -1106,9 +1106,11 @@ func generateImportSh(o *options, outDir string, ext string) {
 	sb.WriteString("# gauss2sql-go v" + version + " 自动生成的导入脚本\n")
 	sb.WriteString("# 用法: TARGET_DB=<目标库名> gsql -d $TARGET_DB -f import.sh\n")
 	sb.WriteString("#   或: gsql -d <目标库> -f <某个 .sql/.ddl 文件>\n")
+	sb.WriteString("# v0.2.21: 每个文件前先在同一 gsql 会话里执行 \\encoding UTF8，\n")
+	sb.WriteString("# 确保源端 GBK/GB18030 库导出的 UTF-8 文本按 UTF-8 载入目标库。\n")
 	sb.WriteString("set -e\n\n")
 	for _, f := range files {
-		sb.WriteString(fmt.Sprintf("gsql -f %q\n", f))
+		sb.WriteString(fmt.Sprintf("gsql -c '\\encoding UTF8' -f %q\n", f))
 	}
 
 	path := filepath.Join(outDir, "import.sh")

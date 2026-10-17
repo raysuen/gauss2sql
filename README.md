@@ -1,8 +1,10 @@
 # gauss2sql-go
 
+> 语言：中文 | [English](README_EN.md)
+
 > 作者：raysuen
 
-> 当前版本：**v0.2.20**（变更记录见[第五节](#五变更记录)）
+> 当前版本：**v0.2.21**（变更记录见[第五节](#五变更记录)）
 
 > 离线解析 openGauss（含 openGauss 衍生库）数据目录堆文件并导出为 SQL / CSV / DDL / 元数据 JSON 的 Go 实现。
 
@@ -254,6 +256,29 @@ gauss2sql-go base/16388/16414 --catalog-json meta.json --table-name app.t_del --
 ---
 
 ## 五、变更记录
+
+- **v0.2.21（2026-10-15）**：**GBK/GB18030 字符集端到端修复——jsonb 字符串 leaf 走 codec / DDL 片段走 codec / 导入脚本设 UTF8 编码**——
+  - **C1 jsonb 字符串 leaf 走全局 codec（`internal/types/types.go` `jsonbScalarToText`）**：实测 openGauss 6.0.5 GBK 库（encoding=GBK oid=6）上 jsonb 容器内字符串 leaf **以 GBK 字节存储**（"备注"磁盘字节 `B1 B8 D7 A2`，非 UTF-8 `E5 A4 87…`），与普通 text 列编码一致。此前一度误判"jsonb 恒为 UTF-8"而强制 UTF-8 解码，导致 GBK 字节按 UTF-8 校验失败后 latin-1 逐字节兜底、输出 `±¸×¢` 乱码。修正后：jsonb 提取出的字符串 leaf 字节统一走 `binary.DecodeBytes`（全局 codec，GBK→UTF-8），与 text 列路径一致；嵌套对象/数组内每个字符串 leaf 递归转码。UTF-8 库上 codec=UTF8 直通，输出逐字节不变。
+  - **C2 SQL 转义顺序确认 + 单测（`internal/types/types_test.go`）**：确认管线为「`DecodeValue` 先把字节解码成 UTF-8 rune 串 → `SQLStringLiteral` 再按 rune 做 `'`→`''`、`\`→`\\`、控制字符 `\xXX` 转义」，顺序正确；补充单测覆盖中文+引号+反斜杠组合、GBK 文本 varlena 端到端解码再转义。
+  - **C3 中文 DDL 片段走 codec（`internal/catalog/catalog.go` `varlenaText`）**：`pg_attrdef.adsrc`（列默认值）、`pg_description.description`（表/列注释）、`pg_constraint.conbin`（CHECK 表达式）经 `varlenaText` 剥头后旧版直接 `string(payload)` 强转，未走全局 codec——GBK 库上中文默认值/注释/约束表达式乱码。现剥头后统一走 `binary.DecodeBytes`。`pg_constraint.conname`/`relname`/`attname`/namespace 名此前已走 `DecodeBytes`/`cstring`，确认无误。UTF-8 库上 `DecodeBytes` 直通，输出逐字节不变。
+  - **C4 import.sh 自动写 `\encoding UTF8`（`main.go` 导入脚本生成处）**：批量导出自动生成的 `import.sh` 每个 `gsql -f` 前先在同一会话执行 `\encoding UTF8`，确保源端 GBK/GB18030 库导出的 UTF-8 文本按 UTF-8 载入目标库。
+  - **C5 版本号**：`main.go` / `go.mod` 头注释 / 本变更记录同步至 v0.2.21；Author: raysuen 保留。
+  - **回归**：UTF-8 数据目录（data_v6.0.6_go2 `base/16385/16395` t_all_types）`--ddl --sql` 输出 md5 仍为 `dc1154c2825ebfe37381bf4dbea5395c`（9901B），与 v0.2.20 逐字节一致；`go test ./...` 全 PASS。
+  - **实测矩阵（openGauss 5.0.0 / 6.0.5 / 6.0.6 三版本，2026-10-15）**：
+    - **三版本对比**：utf8.Valid 5.0.0=12/12+14/14、6.0.5=17/17（基准）、6.0.6=13/13+15/15；jsonb 中文 5.0.0=`备注/测试/城市/北京`、6.0.5=同、6.0.6=`城市/区县/东城/朝阳`；中文标识符（表名/列名/注释）、TOAST 大字段（5.0.0 6000/10000 字、6.0.5 28218B、6.0.6 ~6.4k 字）、bpchar 尾随空格、空串 vs NULL、GB18030 扩展字 `㐀㑭㠇` 三版本全过；latin-1 乱码特征三版本均 0 命中；跨版本 INSERT 数据行与 6.0.5 逐字节一致。
+    - **6.0.5 基准（端口 5640/5642）**：GBK 源（`_og/data_gbk`，appdb OID=16385）离线导出 t_base(16387)/"中文表"(16393)/t_jsonb(16401)/t_toast(16407)/t_bpchar(16413)/t_null(16416) 共 6 表，输出文件 utf8.Valid 100%、中文关键词命中（t_jsonb 含 `备注/测试/城市/北京/价格/RMB/苹果/香蕉/橘子`）、无 latin-1 乱码特征（`±¸×¢`/`³ÇÊÐ`/`±±¾©` 等）。
+    - GBK→UTF8 目标 round-trip：5 张普通表逐字节一致；t_jsonb 因 jsonb 内部键排序与 collation 相关（GBK zh_CN.gbk vs UTF8 en_US.utf8 键序不同），按**键值对集合**（`jsonb_each_text` + `LC_ALL=C sort`）比对一致，不能用 `doc::text` 直接 diff。
+    - GBK→GBK 目标（PGCLIENTENCODING=UTF8 导入）：t_jsonb 从修复前 **0 行**（`character 0xc2 0xb8 in UTF8 has no equivalent in GBK` 整表失败）→ 修复后 **3 行正常入库**。
+    - GB18030 源（`_og/data_gb18030`）：t_base/t_jsonb/t_toast/t_bpchar/t_null 全通过；t_ext(16422) 扩展字 `㐀㑭㠇` round-trip 正确。
+    - **12 套 UTF8 数据目录（5.0.0~6.0.6）复跑基线**：t_all_types SQL md5 `dc1154c2825ebfe37381bf4dbea5395c`（9901B）、CSV md5 `055f86955fd0b93a02effb04589617d1`，在 5.0.0（dbOID=18285/rel=18295）与 6.0.6_go2（dbOID=16385/rel=16395）上均与 v0.2.20 逐字节一致，无回归。
+    - **版本差异（不影响 v0.2.21 导出器）**：5.0.0 `pg_class` 无 `reltableid` 列（6.x 新增，导出器未依赖）；6.0.6 `postgresql.conf` 不接受 `unix_socket_directories`/`enable_cluster_resize`，仅需 port+listen_addresses；灌库时须 `PGCLIENTENCODING=UTF8`（客户端编码协商，非导出器问题）。
+  - **踩坑点（实测沉淀）**：
+    1. **openGauss HA 端口 = 主端口+1**：同一 postmaster 监听两个端口，排端口须成对避让（实测 GBK 5640→HA5641、GB18030 5642→HA5643、UTF8 5645→HA5646、GBK 目标 5648→HA5649）。
+    2. **LOCPATH 双向注意**：自建 zh_CN.gbk/zh_CN.gb18030 在用户目录，跑 gaussdb/gs_initdb 须 `export LOCPATH=_og/usr/lib/locale`；但 initdb UTF8 集群时该变量会覆盖系统 locale 查找导致 `invalid locale "en_US.UTF-8"`，需 `unset LOCPATH` 用系统 en_US.utf8。
+    3. **jsonb 键序 ≠ 内容差异**：jsonb 内部按键字节排序，不同 collation 下中文键顺序不同；判定 round-trip 必须用顺序无关的键值对集合，不能直接 diff `doc::text`。
+    4. **utf8.Valid 不能替代内容校验**：C1 乱码是"latin-1 字符再编码为 UTF-8"，字节合法但内容错误，须 grep 中文关键词 + 排除乱码特征。
+    5. **后台进程回收**：裸 `nohup &` 随 shell 结束被杀，须 `setsid bash -c "...; exec gaussdb" & disown` 脱离会话。
+    6. **导入非 UTF8 库**：导出 .sql 是 UTF-8；导 GBK/GB18030 库须 `PGCLIENTENCODING=UTF8` 或依赖 C4 在 import.sh 内嵌 `\encoding UTF8`，否则报 `invalid byte sequence for encoding "GBK"`。
 
 - **v0.2.20（2026-10-14）**：**批量导出四项增强——多值 INSERT / 表间并行 / 统计报告 / 自动导入脚本（全部默认关闭）**——
   - **`--batch-rows N`（多值 INSERT）**：每 N 行合并为一条 INSERT（列名只写一次）。默认 N=0 关闭，即每行一条 INSERT，与旧版逐字节一致。
